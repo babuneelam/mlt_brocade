@@ -28,6 +28,11 @@
 #include <linux/memory.h>
 #include <linux/math64.h>
 #include <linux/fault-inject.h>
+#include <linux/kmemleak.h>
+#include <linux/kernel.h>
+#ifdef CONFIG_SILKWORM_SLUG
+#include <linux/module.h>
+#endif
 
 /*
  * Lock order:
@@ -140,6 +145,7 @@
 #define DEBUG_DEFAULT_FLAGS (SLAB_DEBUG_FREE | SLAB_RED_ZONE | \
 				SLAB_POISON | SLAB_STORE_USER)
 
+
 /*
  * Debugging flags that require metadata to be stored in the slab.  These get
  * disabled when slub_debug=O is used and a cache's min order increases with
@@ -179,6 +185,26 @@ static int kmem_size = sizeof(struct kmem_cache);
 static struct notifier_block slab_notifier;
 #endif
 
+#ifdef CONFIG_SILKWORM_SLUG
+#define CONFIG_DFREE_ON			1	/* enable deferred free without needing slub debug */
+#define SLUG_DEBUG_MAX_PRINT_SIZE	64
+#define SLUG_STACK_SIZE			8
+#define SLUG_DFREE_TMOUT		(300 * HZ)	/* 5 minutes to timeout min_partial growth */
+
+#define KMALLOC_PRIME_SIZE 		(4096 * 1024)	/* 4 MB */
+
+static inline void *get_slug_alloc(struct kmem_cache *s, void *object);
+static inline void *get_slug_free(struct kmem_cache *s, void *object);
+static inline void *get_cold_pointer(struct kmem_cache *s, void *object);
+void *__kmalloc_brcd(size_t size, gfp_t flags);
+void *vmalloc_brcd(unsigned long size);
+void vfree_brcd(const void *addr);
+static int slub_validate_off = 0;
+#endif
+#ifdef CONFIG_SILKWORM
+void kick_watchdog(void);
+#endif
+
 static enum {
 	DOWN,		/* No slab functionality available */
 	PARTIAL,	/* kmem_cache_open() works but kmalloc does not */
@@ -208,9 +234,9 @@ static int sysfs_slab_alias(struct kmem_cache *, const char *);
 static void sysfs_slab_remove(struct kmem_cache *);
 
 #else
-static inline int sysfs_slab_add(struct kmem_cache *s) { return 0; }
+static inline int sysfs_slab_add(struct kmem_cache *s) { return 0;}
 static inline int sysfs_slab_alias(struct kmem_cache *s, const char *p)
-							{ return 0; }
+{ return 0;}
 static inline void sysfs_slab_remove(struct kmem_cache *s)
 {
 	kfree(s);
@@ -234,7 +260,7 @@ int slab_is_available(void)
 	return slab_state >= UP;
 }
 
-static inline struct kmem_cache_node *get_node(struct kmem_cache *s, int node)
+static inline struct kmem_cache_node *get_node(struct kmem_cache *s, int node) 
 {
 #ifdef CONFIG_NUMA
 	return s->node[node];
@@ -245,7 +271,7 @@ static inline struct kmem_cache_node *get_node(struct kmem_cache *s, int node)
 
 /* Verify that a pointer has an address that is valid within a slab page */
 static inline int check_valid_pointer(struct kmem_cache *s,
-				struct page *page, const void *object)
+				      struct page *page, const void *object)
 {
 	void *base;
 
@@ -254,7 +280,7 @@ static inline int check_valid_pointer(struct kmem_cache *s,
 
 	base = page_address(page);
 	if (object < base || object >= base + page->objects * s->size ||
-		(object - base) % s->size) {
+	    (object - base) % s->size) {
 		return 0;
 	}
 
@@ -283,11 +309,11 @@ static inline void set_freepointer(struct kmem_cache *s, void *object, void *fp)
 /* Determine object index from a given position */
 static inline int slab_index(void *p, struct kmem_cache *s, void *addr)
 {
-	return (p - addr) / s->size;
+	return(p - addr) / s->size;
 }
 
 static inline struct kmem_cache_order_objects oo_make(int order,
-						unsigned long size)
+						      unsigned long size)
 {
 	struct kmem_cache_order_objects x = {
 		(order << OO_SHIFT) + (PAGE_SIZE << order) / size
@@ -306,6 +332,14 @@ static inline int oo_objects(struct kmem_cache_order_objects x)
 	return x.x & OO_MASK;
 }
 
+#ifdef CONFIG_SILKWORM
+/* external api to return the number of objects per slab */
+int kmem_cache_objects(struct kmem_cache *s)
+{
+	return (oo_objects(s->oo));
+}
+#endif
+
 #ifdef CONFIG_SLUB_DEBUG
 /*
  * Debug settings:
@@ -322,6 +356,223 @@ static int disable_higher_order_debug;
 /*
  * Object debugging
  */
+
+#ifdef CONFIG_SILKWORM_SLUG
+int is_dfree_on(void)
+{
+#ifdef CONFIG_DFREE_ON
+	return 1;
+#else
+	if (slub_debug & SLAB_POISON)
+		return 1;
+	return 0;
+#endif
+}
+
+static inline void print_slug_free(struct kmem_cache *s, void *object)
+{	
+	int i;
+	void **x;
+
+	x = (void **)get_slug_free(s, object);
+
+	printk(KERN_EMERG "KFREE Stack: for %d bytes starting at 0x%p from cache 0x%p:\n", s->objsize, object, s);
+	for(i=0; i<SLUG_STACK_SIZE; i++) {
+		if (*(x+i) == 0)
+			break;
+		printk(KERN_EMERG "0x%8p [%8p] %pS", (x+i), *(x+i), *(x+i)); 		
+	}
+	printk(KERN_EMERG "\n");	
+}
+
+static inline void print_slug_alloc(struct kmem_cache *s, void *object)
+{	
+	int i;
+	void **x;
+
+	x = (void **)get_slug_alloc(s, object);
+
+	printk(KERN_EMERG "KMALLOC Stack: for %d bytes starting at 0x%p from cache 0x%p:\n", s->objsize, object, s); 
+	for(i=0; i<SLUG_STACK_SIZE; i++) {
+		if (*(x+i) == 0)
+			break;
+		printk(KERN_EMERG "0x%8p [%8p] %pS", (x+i), *(x+i), *(x+i)); 		
+	}
+	printk(KERN_EMERG "\n");	
+}
+
+static inline void print_slug(struct kmem_cache *s, void *object)
+{	
+	printk(KERN_EMERG "\n");
+	print_slug_alloc(s, object);
+	print_slug_free(s, object);
+}
+
+#define SLUB_MAX_STK 30
+void set_slug_stack(void *ptr, void *object)
+{
+        unsigned long sp;
+	unsigned long slub_stk_trace[SLUB_MAX_STK];
+        int i, stk_offset, stk_cnt, depth;
+
+	memset(slub_stk_trace, 0, sizeof(slub_stk_trace));
+        asm("mr %0,1" : "=r" (sp));
+
+        for (stk_cnt=0; stk_cnt< SLUB_MAX_STK; stk_cnt++)
+        {
+		if (!validate_sp(sp, current, STACK_FRAME_OVERHEAD))
+                        break;
+
+                slub_stk_trace[stk_cnt] = ((unsigned long *)sp)[STACK_FRAME_LR_SAVE];
+                sp = ((unsigned long *)sp)[0];
+        }
+
+	/* find module stack frame */
+	stk_offset = 0;
+	for (i=0; i<stk_cnt; i++)
+	{
+		if (is_vmalloc_or_module_addr((void *)slub_stk_trace[i]))
+		{
+			/* back up one on stack */
+			if (i != 0)
+				stk_offset = i - 1;
+
+			/* back up some more if we don't fill up the stack buffer */
+			depth = stk_cnt - i;
+			if (depth < SLUG_STACK_SIZE)
+			{
+				if (i > (SLUG_STACK_SIZE - depth))
+					stk_offset = i - (SLUG_STACK_SIZE - depth);
+				else
+					stk_offset = 0;
+			}
+			break;
+		}
+	}
+
+	if (stk_offset < 0)
+		stk_offset = 0;
+	memcpy(ptr, &slub_stk_trace[stk_offset], sizeof(void *) * SLUG_STACK_SIZE);
+}
+
+static inline void set_cold_free_pointer_from_page(struct page *page, void *fp) {	
+	void *x;
+	int mlt_off = 0;
+
+#ifdef CONFIG_SILKWORM_MLT
+	mlt_off = sizeof(MLT_book_keeping_info_t);
+#endif
+	
+	// BUG if not a slab page
+	BUG_ON(!PageSlab(page));
+
+	x = page_address(page);
+	if (page->slab->offset)
+		x += page->slab->offset + sizeof(void *) + mlt_off;
+	else
+		x += page->slab->inuse + mlt_off;
+	
+	*(void **)x = fp;
+	return;
+	
+}
+
+// return *(page->coldpointer);
+static inline void *get_cold_free_pointer_from_page(struct page *page) {	
+	void *x;
+	int mlt_off = 0;
+
+#ifdef CONFIG_SILKWORM_MLT
+	mlt_off = sizeof(MLT_book_keeping_info_t);
+#endif
+	
+	if (unlikely(ZERO_OR_NULL_PTR(page)))
+		return NULL;
+
+	// BUG if not a slab page
+	BUG_ON(!PageSlab(page));
+
+	x = page_address(page);
+	if (page->slab->offset)
+		x += page->slab->offset + sizeof(void *) + mlt_off;
+	else
+		x += page->slab->inuse + mlt_off;
+	
+	return *(void **)x;
+}
+
+
+static inline void set_cold_pointer(struct kmem_cache *s, void *object, void *fp)
+{	
+	void **p;
+	int mlt_off = 0;
+
+#ifdef CONFIG_SILKWORM_MLT
+	mlt_off = sizeof(MLT_book_keeping_info_t);
+#endif
+
+	if (s->offset)
+		p = (void **)(object + s->offset + sizeof(void *) + mlt_off + sizeof(void *));
+	else
+		p = (void **)(object + s->inuse + mlt_off + sizeof(void *));
+
+	*p = fp;
+}
+
+
+static inline void *get_cold_pointer(struct kmem_cache *s, void *object)
+{
+	void **p;
+	int mlt_off = 0;
+
+#ifdef CONFIG_SILKWORM_MLT
+	mlt_off = sizeof(MLT_book_keeping_info_t);
+#endif
+
+	if (s->offset)
+		p = (void **)(object + s->offset + sizeof(void *) + mlt_off + sizeof(void *));
+	else
+		p = (void **)(object + s->inuse + mlt_off + sizeof(void *));
+
+	return *p;
+}
+
+static inline void *get_slug_alloc(struct kmem_cache *s, void *object)
+{
+	void *p;
+	int mlt_off = 0;
+
+#ifdef CONFIG_SILKWORM_MLT
+	mlt_off = sizeof(MLT_book_keeping_info_t);
+#endif
+
+	if (s->offset)
+		p = (void *)(object + s->offset + sizeof(void *) + mlt_off + (sizeof(void *) * 2));
+	else
+		p = (void *)(object + s->inuse + mlt_off + (sizeof(void *) * 2));
+
+	return p;
+}
+
+static inline void *get_slug_free(struct kmem_cache *s, void *object)
+{
+	void *p;
+	int mlt_off = 0;
+
+#ifdef CONFIG_SILKWORM_MLT
+	mlt_off = sizeof(MLT_book_keeping_info_t);
+#endif
+
+	if (s->offset)
+		p = (void *)(object + s->offset + sizeof(void *) + mlt_off + (sizeof(void *) * 2) + (sizeof(void *) * SLUG_STACK_SIZE));
+	else
+		p = (void *)(object + s->inuse + mlt_off + (sizeof(void *) * 2) + (sizeof(void *) * SLUG_STACK_SIZE));
+
+	return p;
+}
+#endif
+
+
 static void print_section(char *text, u8 *addr, unsigned int length)
 {
 	int i, offset;
@@ -355,20 +606,36 @@ static void print_section(char *text, u8 *addr, unsigned int length)
 }
 
 static struct track *get_track(struct kmem_cache *s, void *object,
-	enum track_item alloc)
+			       enum track_item alloc)
 {
 	struct track *p;
 
+#ifdef CONFIG_SILKWORM_MLT
+	if (s->offset)
+		p = object + s->offset + sizeof(void *) + sizeof(MLT_book_keeping_info_t);
+	else
+		p = object + s->inuse + sizeof(MLT_book_keeping_info_t);
+#else
 	if (s->offset)
 		p = object + s->offset + sizeof(void *);
 	else
 		p = object + s->inuse;
+#endif
+
+#ifdef CONFIG_SILKWORM_SLUG
+	if (s->flags & SLAB_DFREE)
+	{
+		p = (struct track *)((void *)p + (sizeof(void *) * 2));
+		if (slub_debug & SLAB_POISON)
+			p = (struct track *)((void *)p + (sizeof(void *) * SLUG_STACK_SIZE * 2));
+	}
+#endif
 
 	return p + alloc;
 }
 
 static void set_track(struct kmem_cache *s, void *object,
-			enum track_item alloc, unsigned long addr)
+		      enum track_item alloc, unsigned long addr)
 {
 	struct track *p = get_track(s, object, alloc);
 
@@ -396,7 +663,7 @@ static void print_track(const char *s, struct track *t)
 		return;
 
 	printk(KERN_ERR "INFO: %s in %pS age=%lu cpu=%u pid=%d\n",
-		s, (void *)t->addr, jiffies - t->when, t->cpu, t->pid);
+	       s, (void *)t->addr, jiffies - t->when, t->cpu, t->pid);
 }
 
 static void print_tracking(struct kmem_cache *s, void *object)
@@ -410,8 +677,20 @@ static void print_tracking(struct kmem_cache *s, void *object)
 
 static void print_page_info(struct page *page)
 {
+#ifdef CONFIG_SILKWORM_SLUG
+	void *start, *end;
+	unsigned long length;
+
+	start = page_address(page);
+	length = (PAGE_SIZE << compound_order(page));
+	end = start + length;
+	printk(KERN_ERR "INFO: Slab 0x%p objects=%u used=%u fp=0x%p flags=0x%04lx start=%p end=%p\n",
+	       page, page->objects, page->inuse, page->freelist, page->flags, start, end);
+
+#else
 	printk(KERN_ERR "INFO: Slab 0x%p objects=%u used=%u fp=0x%p flags=0x%04lx\n",
-		page, page->objects, page->inuse, page->freelist, page->flags);
+	       page, page->objects, page->inuse, page->freelist, page->flags);
+#endif
 
 }
 
@@ -424,10 +703,10 @@ static void slab_bug(struct kmem_cache *s, char *fmt, ...)
 	vsnprintf(buf, sizeof(buf), fmt, args);
 	va_end(args);
 	printk(KERN_ERR "========================================"
-			"=====================================\n");
+	       "=====================================\n");
 	printk(KERN_ERR "BUG %s: %s\n", s->name, buf);
 	printk(KERN_ERR "----------------------------------------"
-			"-------------------------------------\n\n");
+	       "-------------------------------------\n\n");
 }
 
 static void slab_fix(struct kmem_cache *s, char *fmt, ...)
@@ -441,31 +720,65 @@ static void slab_fix(struct kmem_cache *s, char *fmt, ...)
 	printk(KERN_ERR "FIX %s: %s\n", s->name, buf);
 }
 
+#ifdef CONFIG_SILKWORM_SLUG
+static void print_trailer(struct kmem_cache *s, struct page *page, u8 *p, unsigned long fault)
+#else
 static void print_trailer(struct kmem_cache *s, struct page *page, u8 *p)
+#endif
 {
-	unsigned int off;	/* Offset of last byte */
+	unsigned int off;   /* Offset of last byte */
 	u8 *addr = page_address(page);
+#ifdef CONFIG_SILKWORM_SLUG
+	u8 *start;
+#endif
 
 	print_tracking(s, p);
 
 	print_page_info(page);
 
+#ifdef CONFIG_SILKWORM_SLUG
+	if (s->flags & (SLAB_DFREE | SLAB_RED_ZONE))
+		start = p + cache_line_size();
+	else
+		start = p;
+	printk(KERN_ERR "INFO: Object 0x%p User start=0x%p @offset=%tu fp=0x%p\n\n",
+	       p, start, p - addr, get_freepointer(s, p));
+#else
 	printk(KERN_ERR "INFO: Object 0x%p @offset=%tu fp=0x%p\n\n",
-			p, p - addr, get_freepointer(s, p));
+	       p, p - addr, get_freepointer(s, p));
+#endif
 
 	if (p > addr + 16)
 		print_section("Bytes b4", p - 16, 16);
 
+#ifdef CONFIG_SILKWORM_SLUG
+	fault &= ~0xf;
+	print_section("Object", (u8 *)((unsigned long)(p) + fault), min_t(unsigned long, s->objsize - fault, SLUG_DEBUG_MAX_PRINT_SIZE));
+#else
 	print_section("Object", p, min_t(unsigned long, s->objsize, PAGE_SIZE));
+#endif
 
 	if (s->flags & SLAB_RED_ZONE)
 		print_section("Redzone", p + s->objsize,
-			s->inuse - s->objsize);
+			      s->inuse - s->objsize);
 
 	if (s->offset)
 		off = s->offset + sizeof(void *);
 	else
 		off = s->inuse;
+
+#ifdef CONFIG_SILKWORM_MLT
+	off += sizeof(MLT_book_keeping_info_t);
+#endif
+
+#ifdef CONFIG_SILKWORM_SLUG
+	if (s->flags & SLAB_DFREE)
+	{
+		off += 2*sizeof(void *);	/* cold free pointer and cold pointer */
+		if (slub_debug & SLAB_POISON)
+			off += sizeof(void *) * SLUG_STACK_SIZE * 2;	/* alloc and free stack frames */
+	}
+#endif
 
 	if (s->flags & SLAB_STORE_USER)
 		off += 2 * sizeof(struct track);
@@ -474,16 +787,35 @@ static void print_trailer(struct kmem_cache *s, struct page *page, u8 *p)
 		/* Beginning of the filler is the free pointer */
 		print_section("Padding", p + off, s->size - off);
 
+#ifdef CONFIG_SILKWORM_SLUG
+	if (s->flags & SLAB_DFREE)
+	{
+		int save_message_loglevel;
+		save_message_loglevel = default_message_loglevel;
+		default_message_loglevel = minimum_console_loglevel;
+		if (slub_debug & SLAB_POISON)
+			print_slug(s, p);
+		printk(KERN_EMERG "The following is the CURRENT Stack:\n");
+		dump_stack();
+		default_message_loglevel = save_message_loglevel;
+	}
+	else
+		dump_stack();
+#else
 	dump_stack();
+#endif
 }
 
 static void object_err(struct kmem_cache *s, struct page *page,
-			u8 *object, char *reason)
+		       u8 *object, char *reason)
 {
 	slab_bug(s, "%s", reason);
+#ifdef CONFIG_SILKWORM_SLUG
+	print_trailer(s, page, object, 0);
+#else
 	print_trailer(s, page, object);
+#endif
 }
-
 static void slab_err(struct kmem_cache *s, struct page *page, char *fmt, ...)
 {
 	va_list args;
@@ -494,7 +826,18 @@ static void slab_err(struct kmem_cache *s, struct page *page, char *fmt, ...)
 	va_end(args);
 	slab_bug(s, "%s", buf);
 	print_page_info(page);
+#ifdef CONFIG_SILKWORM
+	{
+		int save_message_loglevel;
+		save_message_loglevel = default_message_loglevel;
+		default_message_loglevel = minimum_console_loglevel;
+		printk(KERN_EMERG "The following is the CURRENT Stack:\n");
+		dump_stack();
+		default_message_loglevel = save_message_loglevel;
+	}
+#else
 	dump_stack();
+#endif
 }
 
 static void init_object(struct kmem_cache *s, void *object, int active)
@@ -508,8 +851,8 @@ static void init_object(struct kmem_cache *s, void *object, int active)
 
 	if (s->flags & SLAB_RED_ZONE)
 		memset(p + s->objsize,
-			active ? SLUB_RED_ACTIVE : SLUB_RED_INACTIVE,
-			s->inuse - s->objsize);
+		       active ? SLUB_RED_ACTIVE : SLUB_RED_INACTIVE,
+		       s->inuse - s->objsize);
 }
 
 static u8 *check_bytes(u8 *start, unsigned int value, unsigned int bytes)
@@ -524,19 +867,39 @@ static u8 *check_bytes(u8 *start, unsigned int value, unsigned int bytes)
 }
 
 static void restore_bytes(struct kmem_cache *s, char *message, u8 data,
-						void *from, void *to)
+			  void *from, void *to)
 {
 	slab_fix(s, "Restoring 0x%p-0x%p=0x%x\n", from, to - 1, data);
 	memset(from, data, to - from);
 }
 
 static int check_bytes_and_report(struct kmem_cache *s, struct page *page,
-			u8 *object, char *what,
-			u8 *start, unsigned int value, unsigned int bytes)
+				  u8 *object, char *what,
+				  u8 *start, unsigned int value, unsigned int bytes)
 {
 	u8 *fault;
 	u8 *end;
+#ifdef CONFIG_SILKWORM_SLUG
+	unsigned long offset = 0;
+#endif
 
+#ifdef CONFIG_SILKWORM_SLUG
+	if (s->flags & SLAB_DFREE)
+	{
+		/* check header */
+		if (start != object)
+		{
+			fault = check_bytes(object, POISON_FREE, cache_line_size());
+			if (fault)
+			{
+				slab_bug(s, "Object underrun");
+				value = POISON_FREE;
+				end = object + cache_line_size();
+				goto print_err;
+			}
+		}
+	}
+#endif
 	fault = check_bytes(start, value, bytes);
 	if (!fault)
 		return 1;
@@ -546,9 +909,17 @@ static int check_bytes_and_report(struct kmem_cache *s, struct page *page,
 		end--;
 
 	slab_bug(s, "%s overwritten", what);
+#ifdef CONFIG_SILKWORM_SLUG
+	offset = (unsigned long)fault-(unsigned long)object;
+	print_err:
+#endif
 	printk(KERN_ERR "INFO: 0x%p-0x%p. First byte 0x%x instead of 0x%x\n",
-					fault, end - 1, fault[0], value);
+		fault, end - 1, fault[0], value);	
+#ifdef CONFIG_SILKWORM_SLUG
+	print_trailer(s, page, object, offset);
+#else
 	print_trailer(s, page, object);
+#endif
 
 	restore_bytes(s, what, value, fault, end);
 	return 0;
@@ -577,8 +948,12 @@ static int check_bytes_and_report(struct kmem_cache *s, struct page *page,
  * 	Meta data starts here.
  *
  * 	A. Free pointer (if we cannot overwrite object on free)
- * 	B. Tracking data for SLAB_STORE_USER
- * 	C. Padding to reach required alignment boundary or at mininum
+ * 	B. MLT Book keeping data
+ *	B0 Cold Free Pointer
+ *	B1 Cold Pointer
+ *	B3 Slug pointers	
+ * 	C. Tracking data for SLAB_STORE_USER
+ * 	D. Padding to reach required alignment boundary or at mininum
  * 		one word if debugging is on to be able to detect writes
  * 		before the word boundary.
  *
@@ -595,10 +970,23 @@ static int check_bytes_and_report(struct kmem_cache *s, struct page *page,
 static int check_pad_bytes(struct kmem_cache *s, struct page *page, u8 *p)
 {
 	unsigned long off = s->inuse;	/* The end of info */
-
+	
 	if (s->offset)
 		/* Freepointer is placed after the object. */
 		off += sizeof(void *);
+
+#ifdef CONFIG_SILKWORM_MLT
+	off += sizeof(MLT_book_keeping_info_t);
+#endif
+
+#ifdef CONFIG_SILKWORM_SLUG
+	if (s->flags & SLAB_DFREE)
+	{
+		off += 2 * sizeof(void *);	/* cold free pointer and cold pointer */
+		if (slub_debug & SLAB_POISON)
+			off += sizeof(void *) * SLUG_STACK_SIZE * 2;	/* alloc and free stack frames */
+	}
+#endif
 
 	if (s->flags & SLAB_STORE_USER)
 		/* We also have user information there */
@@ -608,7 +996,7 @@ static int check_pad_bytes(struct kmem_cache *s, struct page *page, u8 *p)
 		return 1;
 
 	return check_bytes_and_report(s, page, p, "Object padding",
-				p + off, POISON_INUSE, s->size - off);
+				      p + off, POISON_INUSE, s->size - off);
 }
 
 /* Check the pad bytes at the end of a slab page */
@@ -637,38 +1025,47 @@ static int slab_pad_check(struct kmem_cache *s, struct page *page)
 		end--;
 
 	slab_err(s, page, "Padding overwritten. 0x%p-0x%p", fault, end - 1);
+#ifdef CONFIG_SILKWORM_SLUG
+	fault = (u8 *)((unsigned int)(fault) & ~0xf);
+	print_section("Padding", fault, min_t(unsigned long, end - fault, SLUG_DEBUG_MAX_PRINT_SIZE));
+#else
 	print_section("Padding", end - remainder, remainder);
+#endif
 
+#ifdef CONFIG_SILKWORM_SLUG
+	restore_bytes(s, "slab padding", POISON_INUSE, fault, end);
+#else
 	restore_bytes(s, "slab padding", POISON_INUSE, end - remainder, end);
+#endif
 	return 0;
 }
 
 static int check_object(struct kmem_cache *s, struct page *page,
-					void *object, int active)
+			void *object, int active)
 {
 	u8 *p = object;
 	u8 *endobject = object + s->objsize;
 
 	if (s->flags & SLAB_RED_ZONE) {
 		unsigned int red =
-			active ? SLUB_RED_ACTIVE : SLUB_RED_INACTIVE;
+		active ? SLUB_RED_ACTIVE : SLUB_RED_INACTIVE;
 
 		if (!check_bytes_and_report(s, page, object, "Redzone",
-			endobject, red, s->inuse - s->objsize))
+					    endobject, red, s->inuse - s->objsize))
 			return 0;
 	} else {
 		if ((s->flags & SLAB_POISON) && s->objsize < s->inuse) {
 			check_bytes_and_report(s, page, p, "Alignment padding",
-				endobject, POISON_INUSE, s->inuse - s->objsize);
+					       endobject, POISON_INUSE, s->inuse - s->objsize);
 		}
 	}
 
 	if (s->flags & SLAB_POISON) {
 		if (!active && (s->flags & __OBJECT_POISON) &&
-			(!check_bytes_and_report(s, page, p, "Poison", p,
-					POISON_FREE, s->objsize - 1) ||
-			 !check_bytes_and_report(s, page, p, "Poison",
-				p + s->objsize - 1, POISON_END, 1)))
+		    (!check_bytes_and_report(s, page, p, "Poison", p,
+					     POISON_FREE, s->objsize - 1) ||
+		     !check_bytes_and_report(s, page, p, "Poison",
+					     p + s->objsize - 1, POISON_END, 1)))
 			return 0;
 		/*
 		 * check_pad_bytes cleans up on its own.
@@ -711,18 +1108,52 @@ static int check_slab(struct kmem_cache *s, struct page *page)
 	maxobj = (PAGE_SIZE << compound_order(page)) / s->size;
 	if (page->objects > maxobj) {
 		slab_err(s, page, "objects %u > max %u",
-			s->name, page->objects, maxobj);
+			 s->name, page->objects, maxobj);
 		return 0;
 	}
 	if (page->inuse > page->objects) {
 		slab_err(s, page, "inuse %u > max %u",
-			s->name, page->inuse, page->objects);
+			 s->name, page->inuse, page->objects);
 		return 0;
 	}
 	/* Slab_pad_check fixes things up after itself */
 	slab_pad_check(s, page);
 	return 1;
 }
+
+#ifdef CONFIG_SILKWORM_SLUG
+/* check if object is already on free list */
+static int check_freelist(struct kmem_cache *s, struct page *page, void *search)
+{
+	int nr = 0;
+	void *fp = page->freelist;
+	void *object = NULL;
+
+	while (fp && nr <= page->objects) {
+		if (fp == search)
+			return 1;
+		object = fp;
+		fp = get_freepointer(s, object);
+		nr++;
+	}
+
+	if (s->flags & SLAB_DFREE)
+	{		
+		int cnr = 0;
+		fp = get_cold_free_pointer_from_page(page);
+		while (fp && cnr <= page->objects) 
+		{
+			if (fp == search)
+				return 1;
+			object = fp;
+			fp = get_cold_pointer(s, object);
+			cnr++;
+		}
+	}
+
+	return search == NULL;
+}
+#endif
 
 /*
  * Determine if a certain object on a page is on the freelist. Must hold the
@@ -741,7 +1172,7 @@ static int on_freelist(struct kmem_cache *s, struct page *page, void *search)
 		if (!check_valid_pointer(s, page, fp)) {
 			if (object) {
 				object_err(s, page, object,
-					"Freechain corrupt");
+					   "Freechain corrupt");
 				set_freepointer(s, object, NULL);
 				break;
 			} else {
@@ -764,13 +1195,13 @@ static int on_freelist(struct kmem_cache *s, struct page *page, void *search)
 
 	if (page->objects != max_objects) {
 		slab_err(s, page, "Wrong number of objects. Found %d but "
-			"should be %d", page->objects, max_objects);
+			 "should be %d", page->objects, max_objects);
 		page->objects = max_objects;
 		slab_fix(s, "Number of objects adjusted.");
 	}
 	if (page->inuse != page->objects - nr) {
 		slab_err(s, page, "Wrong object count. Counter is %d but "
-			"counted were %d", page->inuse, page->objects - nr);
+			 "counted were %d", page->inuse, page->objects - nr);
 		page->inuse = page->objects - nr;
 		slab_fix(s, "Object count adjusted.");
 	}
@@ -778,19 +1209,34 @@ static int on_freelist(struct kmem_cache *s, struct page *page, void *search)
 }
 
 static void trace(struct kmem_cache *s, struct page *page, void *object,
-								int alloc)
+		  int alloc)
 {
 	if (s->flags & SLAB_TRACE) {
 		printk(KERN_INFO "TRACE %s %s 0x%p inuse=%d fp=0x%p\n",
-			s->name,
-			alloc ? "alloc" : "free",
-			object, page->inuse,
-			page->freelist);
+		       s->name,
+		       alloc ? "alloc" : "free",
+		       object, page->inuse,
+		       page->freelist);
 
 		if (!alloc)
 			print_section("Object", (void *)object, s->objsize);
 
+#ifdef CONFIG_SILKWORM_SLUG
+		if (s->flags & SLAB_DFREE)
+		{
+			int save_message_loglevel;
+			save_message_loglevel = default_message_loglevel;
+			default_message_loglevel = minimum_console_loglevel;
+			print_slug(s, object);
+			printk(KERN_EMERG "The following is the CURRENT Stack:\n");
+			dump_stack();
+			default_message_loglevel = save_message_loglevel;
+		}
+		else
+			dump_stack();
+#else
 		dump_stack();
+#endif
 	}
 }
 
@@ -834,6 +1280,9 @@ static inline unsigned long node_nr_slabs(struct kmem_cache_node *n)
 static inline void inc_slabs_node(struct kmem_cache *s, int node, int objects)
 {
 	struct kmem_cache_node *n = get_node(s, node);
+#ifdef CONFIG_SILKWORM_SLUG
+	unsigned long x;
+#endif
 
 	/*
 	 * May be called early in order to allocate a slab for the
@@ -844,6 +1293,11 @@ static inline void inc_slabs_node(struct kmem_cache *s, int node, int objects)
 	if (!NUMA_BUILD || n) {
 		atomic_long_inc(&n->nr_slabs);
 		atomic_long_add(objects, &n->total_objects);
+#ifdef CONFIG_SILKWORM_SLUG
+		x = atomic_long_read(&n->total_objects);
+		if (x > s->max_objects)
+			s->max_objects = x;
+#endif
 	}
 }
 static inline void dec_slabs_node(struct kmem_cache *s, int node, int objects)
@@ -856,7 +1310,7 @@ static inline void dec_slabs_node(struct kmem_cache *s, int node, int objects)
 
 /* Object debug checks for alloc/free paths */
 static void setup_object_debug(struct kmem_cache *s, struct page *page,
-								void *object)
+			       void *object)
 {
 	if (!(s->flags & (SLAB_STORE_USER|SLAB_RED_ZONE|__OBJECT_POISON)))
 		return;
@@ -866,8 +1320,8 @@ static void setup_object_debug(struct kmem_cache *s, struct page *page,
 }
 
 static int alloc_debug_processing(struct kmem_cache *s, struct page *page,
-					void *object, unsigned long addr)
-{
+				  void *object, unsigned long addr)
+{		
 	if (!check_slab(s, page))
 		goto bad;
 
@@ -884,6 +1338,14 @@ static int alloc_debug_processing(struct kmem_cache *s, struct page *page,
 	if (!check_object(s, page, object, 0))
 		goto bad;
 
+#ifdef CONFIG_SILKWORM_SLUG
+	if ((s->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+	{
+		void *stk_ptr;
+		stk_ptr = get_slug_alloc(s, object);
+		set_slug_stack(stk_ptr, object);
+	}
+#endif	
 	/* Success perform special debug activities for allocs */
 	if (s->flags & SLAB_STORE_USER)
 		set_track(s, object, TRACK_ALLOC, addr);
@@ -891,7 +1353,7 @@ static int alloc_debug_processing(struct kmem_cache *s, struct page *page,
 	init_object(s, object, 1);
 	return 1;
 
-bad:
+	bad:
 	if (PageSlab(page)) {
 		/*
 		 * If this is a slab page then lets do the best we can
@@ -906,8 +1368,16 @@ bad:
 }
 
 static int free_debug_processing(struct kmem_cache *s, struct page *page,
-					void *object, unsigned long addr)
+				 void *object, unsigned long addr)
 {
+#ifdef CONFIG_SILKWORM_SLUG
+	if ((s->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+	{
+		void *stk_ptr;
+		stk_ptr = get_slug_free(s, object);
+		set_slug_stack(stk_ptr, object);
+	}
+#endif	
 	if (!check_slab(s, page))
 		goto fail;
 
@@ -927,15 +1397,30 @@ static int free_debug_processing(struct kmem_cache *s, struct page *page,
 	if (unlikely(s != page->slab)) {
 		if (!PageSlab(page)) {
 			slab_err(s, page, "Attempt to free object(0x%p) "
-				"outside of slab", object);
+				 "outside of slab", object);
 		} else if (!page->slab) {
 			printk(KERN_ERR
-				"SLUB <none>: no slab for object 0x%p.\n",
-						object);
+			       "SLUB <none>: no slab for object 0x%p.\n",
+			       object);
+#ifdef CONFIG_SILKWORM_SLUG
+			if (s->flags & SLAB_DFREE)
+			{
+				int save_message_loglevel;
+				save_message_loglevel = default_message_loglevel;
+				default_message_loglevel = minimum_console_loglevel;
+				print_slug(s, object);
+				printk(KERN_EMERG "The following is the CURRENT Stack:\n");
+				dump_stack();
+				default_message_loglevel = save_message_loglevel;
+			}
+			else
+				dump_stack();
+#else
 			dump_stack();
+#endif
 		} else
 			object_err(s, page, object,
-					"page slab pointer corrupt.");
+				   "page slab pointer corrupt.");
 		goto fail;
 	}
 
@@ -948,11 +1433,27 @@ static int free_debug_processing(struct kmem_cache *s, struct page *page,
 	init_object(s, object, 0);
 	return 1;
 
-fail:
+	fail:
 	slab_fix(s, "Object at 0x%p not freed", object);
 	return 0;
 }
 
+#ifdef CONFIG_SILKWORM_SLUG
+extern struct kernel_symbol __start___ksymtab[];
+extern struct kernel_symbol __stop___ksymtab[];
+
+/* lookup symbol in given range of kernel_symbols */
+static struct kernel_symbol *lookup_symbol(const char *name,
+	struct kernel_symbol *start,
+	struct kernel_symbol *stop)
+{
+	struct kernel_symbol *ks = start;
+	for (; ks < stop; ks++)
+		if (strcmp(ks->name, name) == 0)
+			return ks;
+	return NULL;
+}
+#endif
 static int __init setup_slub_debug(char *str)
 {
 	slub_debug = DEBUG_DEFAULT_FLAGS;
@@ -974,7 +1475,11 @@ static int __init setup_slub_debug(char *str)
 		 * Avoid enabling debugging on caches if its minimum order
 		 * would increase as a result.
 		 */
+#if defined(CONFIG_SILKWORM_MLT) || defined(CONFIG_SILKWORM_SLUG)
+		disable_higher_order_debug = 0;
+#else
 		disable_higher_order_debug = 1;
+#endif
 		goto out;
 	}
 
@@ -1010,72 +1515,78 @@ static int __init setup_slub_debug(char *str)
 			break;
 		default:
 			printk(KERN_ERR "slub_debug option '%c' "
-				"unknown. skipped\n", *str);
+			       "unknown. skipped\n", *str);
 		}
 	}
 
-check_slabs:
+	check_slabs:
 	if (*str == ',')
 		slub_debug_slabs = str + 1;
-out:
+	out:
 	return 1;
 }
 
 __setup("slub_debug", setup_slub_debug);
 
 static unsigned long kmem_cache_flags(unsigned long objsize,
-	unsigned long flags, const char *name,
-	void (*ctor)(void *))
+				      unsigned long flags, const char *name,
+				      void (*ctor)(void *))
 {
 	/*
 	 * Enable debugging if selected on the kernel commandline.
 	 */
 	if (slub_debug && (!slub_debug_slabs ||
-		!strncmp(slub_debug_slabs, name, strlen(slub_debug_slabs))))
+			   !strncmp(slub_debug_slabs, name, strlen(slub_debug_slabs))))
 		flags |= slub_debug;
+#ifdef CONFIG_SILKWORM_SLUG
+#ifndef CONFIG_DFREE_ON
+	if (!(slub_debug & SLAB_POISON))
+		flags &= ~SLAB_DFREE;	/* disable deferred free if slub_debug not enabled */
+#endif
+#endif
 
 	return flags;
 }
 #else
 static inline void setup_object_debug(struct kmem_cache *s,
-			struct page *page, void *object) {}
+				      struct page *page, void *object) {}
 
 static inline int alloc_debug_processing(struct kmem_cache *s,
-	struct page *page, void *object, unsigned long addr) { return 0; }
+					 struct page *page, void *object, unsigned long addr) { return 0;}
 
 static inline int free_debug_processing(struct kmem_cache *s,
-	struct page *page, void *object, unsigned long addr) { return 0; }
+					struct page *page, void *object, unsigned long addr) { return 0;}
 
 static inline int slab_pad_check(struct kmem_cache *s, struct page *page)
-			{ return 1; }
+{ return 1;}
 static inline int check_object(struct kmem_cache *s, struct page *page,
-			void *object, int active) { return 1; }
+			       void *object, int active) { return 1;}
 static inline void add_full(struct kmem_cache_node *n, struct page *page) {}
 static inline unsigned long kmem_cache_flags(unsigned long objsize,
-	unsigned long flags, const char *name,
-	void (*ctor)(void *))
+					     unsigned long flags, const char *name,
+					     void (*ctor)(void *))
 {
 	return flags;
 }
 #define slub_debug 0
 
 #define disable_higher_order_debug 0
-
+	
 static inline unsigned long slabs_node(struct kmem_cache *s, int node)
-							{ return 0; }
+{ return 0;}
 static inline unsigned long node_nr_slabs(struct kmem_cache_node *n)
-							{ return 0; }
+{ return 0;}
 static inline void inc_slabs_node(struct kmem_cache *s, int node,
-							int objects) {}
+				  int objects) {}
 static inline void dec_slabs_node(struct kmem_cache *s, int node,
-							int objects) {}
+				  int objects) {}
 #endif
 
 /*
  * Slab allocation and freeing
  */
 static inline struct page *alloc_slab_page(gfp_t flags, int node,
-					struct kmem_cache_order_objects oo)
+					   struct kmem_cache_order_objects oo)
 {
 	int order = oo_order(oo);
 
@@ -1116,7 +1627,7 @@ static struct page *allocate_slab(struct kmem_cache *s, gfp_t flags, int node)
 	}
 
 	if (kmemcheck_enabled
-		&& !(s->flags & (SLAB_NOTRACK | DEBUG_DEFAULT_FLAGS))) {
+	    && !(s->flags & (SLAB_NOTRACK | DEBUG_DEFAULT_FLAGS))) {
 		int pages = 1 << oo_order(oo);
 
 		kmemcheck_alloc_shadow(page, oo_order(oo), flags, node);
@@ -1133,15 +1644,15 @@ static struct page *allocate_slab(struct kmem_cache *s, gfp_t flags, int node)
 
 	page->objects = oo_objects(oo);
 	mod_zone_page_state(page_zone(page),
-		(s->flags & SLAB_RECLAIM_ACCOUNT) ?
-		NR_SLAB_RECLAIMABLE : NR_SLAB_UNRECLAIMABLE,
-		1 << oo_order(oo));
+			    (s->flags & SLAB_RECLAIM_ACCOUNT) ?
+			    NR_SLAB_RECLAIMABLE : NR_SLAB_UNRECLAIMABLE,
+			    1 << oo_order(oo));
 
 	return page;
 }
 
 static void setup_object(struct kmem_cache *s, struct page *page,
-				void *object)
+			 void *object)
 {
 	setup_object_debug(s, page, object);
 	if (unlikely(s->ctor))
@@ -1158,11 +1669,19 @@ static struct page *new_slab(struct kmem_cache *s, gfp_t flags, int node)
 	BUG_ON(flags & GFP_SLAB_BUG_MASK);
 
 	page = allocate_slab(s,
-		flags & (GFP_RECLAIM_MASK | GFP_CONSTRAINT_MASK), node);
+			     flags & (GFP_RECLAIM_MASK | GFP_CONSTRAINT_MASK), node);
 	if (!page)
 		goto out;
 
 	inc_slabs_node(s, page_to_nid(page), page->objects);
+#ifdef CONFIG_SILKWORM_SLUG
+	if (s->flags & SLAB_DFREE)
+	{
+		/* on every new slab, we will increase tmp_partial */
+		atomic_long_set(&s->tmp_partial, node_nr_slabs(get_node(s, node)));
+		s->tmp_partial_age = jiffies;
+	}
+#endif
 	page->slab = s;
 	page->flags |= 1 << PG_slab;
 	if (s->flags & (SLAB_DEBUG_FREE | SLAB_RED_ZONE | SLAB_POISON |
@@ -1185,31 +1704,70 @@ static struct page *new_slab(struct kmem_cache *s, gfp_t flags, int node)
 
 	page->freelist = start;
 	page->inuse = 0;
-out:
+	out:
 	return page;
 }
+
+#ifdef CONFIG_SILKWORM_SLUG
+static void add_free(struct kmem_cache *s, struct page *page)
+{
+	spin_lock(&s->free_lock);
+	s->nr_free++;
+	list_add_tail(&page->lru, &s->free);
+	spin_unlock(&s->free_lock);
+}
+
+static void remove_free(struct kmem_cache *s, struct page *page)
+{
+	list_del(&page->lru);
+	s->nr_free--;
+}
+#endif
 
 static void __free_slab(struct kmem_cache *s, struct page *page)
 {
 	int order = compound_order(page);
 	int pages = 1 << order;
 
+#ifdef CONFIG_SILKWORM_SLUG
+	if (s->flags & SLAB_DFREE)
+	{
+		/* hold freeing the slabs until it has cooled off on the free list */
+		add_free(s, page);
+		if (s->nr_free > s->dfree_min)
+		{
+			spin_lock(&s->free_lock);
+			page = list_entry(s->free.next, struct page, lru);
+			remove_free(s, page);
+			spin_unlock(&s->free_lock);
+		}
+		else
+			return;
+	}
+
+#endif
 	if (unlikely(SLABDEBUG && PageSlubDebug(page))) {
 		void *p;
 
-		slab_pad_check(s, page);
-		for_each_object(p, s, page_address(page),
-						page->objects)
+#ifdef CONFIG_SILKWORM_SLUG
+		if (likely(!slub_validate_off)) {
+#endif
+			slab_pad_check(s, page);
+			for_each_object(p, s, page_address(page),
+					page->objects)
 			check_object(s, page, p, 0);
+#ifdef CONFIG_SILKWORM_SLUG
+		}
+#endif
 		__ClearPageSlubDebug(page);
 	}
 
 	kmemcheck_free_shadow(page, compound_order(page));
 
 	mod_zone_page_state(page_zone(page),
-		(s->flags & SLAB_RECLAIM_ACCOUNT) ?
-		NR_SLAB_RECLAIMABLE : NR_SLAB_UNRECLAIMABLE,
-		-pages);
+			    (s->flags & SLAB_RECLAIM_ACCOUNT) ?
+			    NR_SLAB_RECLAIMABLE : NR_SLAB_UNRECLAIMABLE,
+			    -pages);
 
 	__ClearPageSlab(page);
 	reset_page_mapcount(page);
@@ -1270,7 +1828,7 @@ static __always_inline int slab_trylock(struct page *page)
  * Management of partially allocated slabs
  */
 static void add_partial(struct kmem_cache_node *n,
-				struct page *page, int tail)
+			struct page *page, int tail)
 {
 	spin_lock(&n->list_lock);
 	n->nr_partial++;
@@ -1297,7 +1855,7 @@ static void remove_partial(struct kmem_cache *s, struct page *page)
  * Must hold list_lock.
  */
 static inline int lock_and_freeze_slab(struct kmem_cache_node *n,
-							struct page *page)
+				       struct page *page)
 {
 	if (slab_trylock(page)) {
 		list_del(&page->lru);
@@ -1326,10 +1884,10 @@ static struct page *get_partial_node(struct kmem_cache_node *n)
 
 	spin_lock(&n->list_lock);
 	list_for_each_entry(page, &n->partial, lru)
-		if (lock_and_freeze_slab(n, page))
-			goto out;
+	if (lock_and_freeze_slab(n, page))
+		goto out;
 	page = NULL;
-out:
+	out:
 	spin_unlock(&n->list_lock);
 	return page;
 }
@@ -1365,7 +1923,7 @@ static struct page *get_any_partial(struct kmem_cache *s, gfp_t flags)
 	 * with available objects.
 	 */
 	if (!s->remote_node_defrag_ratio ||
-			get_cycles() % 1024 > s->remote_node_defrag_ratio)
+	    get_cycles() % 1024 > s->remote_node_defrag_ratio)
 		return NULL;
 
 	zonelist = node_zonelist(slab_node(current->mempolicy), flags);
@@ -1375,7 +1933,7 @@ static struct page *get_any_partial(struct kmem_cache *s, gfp_t flags)
 		n = get_node(s, zone_to_nid(zone));
 
 		if (n && cpuset_zone_allowed_hardwall(zone, flags) &&
-				n->nr_partial > s->min_partial) {
+		    n->nr_partial > s->min_partial) {
 			page = get_partial_node(n);
 			if (page)
 				return page;
@@ -1410,6 +1968,9 @@ static struct page *get_partial(struct kmem_cache *s, gfp_t flags, int node)
 static void unfreeze_slab(struct kmem_cache *s, struct page *page, int tail)
 {
 	struct kmem_cache_node *n = get_node(s, page_to_nid(page));
+#ifdef CONFIG_SILKWORM_SLUG
+	unsigned long tmp;
+#endif
 
 	__ClearPageSlubFrozen(page);
 	if (page->inuse) {
@@ -1420,13 +1981,18 @@ static void unfreeze_slab(struct kmem_cache *s, struct page *page, int tail)
 		} else {
 			stat(s, DEACTIVATE_FULL);
 			if (SLABDEBUG && PageSlubDebug(page) &&
-						(s->flags & SLAB_STORE_USER))
+			    (s->flags & SLAB_STORE_USER))
 				add_full(n, page);
 		}
 		slab_unlock(page);
 	} else {
 		stat(s, DEACTIVATE_EMPTY);
+#ifdef CONFIG_SILKWORM_SLUG
+		tmp = atomic_long_read(&s->tmp_partial);
+		if (n->nr_partial < max(s->min_partial, tmp)) {
+#else
 		if (n->nr_partial < s->min_partial) {
+#endif
 			/*
 			 * Adding an empty slab to the partial slabs in order
 			 * to avoid page allocator overhead. This slab needs
@@ -1462,10 +2028,36 @@ static void deactivate_slab(struct kmem_cache *s, struct kmem_cache_cpu *c)
 	 * because both freelists are empty. So this is unlikely
 	 * to occur.
 	 */
+#ifdef CONFIG_SILKWORM_SLUG
+	if (s->flags & SLAB_DFREE)
+	{		
+		void **object;
+		void *coldfreepointer;
+
+		coldfreepointer = get_cold_free_pointer_from_page(page);
+		while (unlikely(coldfreepointer)) {
+			/* Retrieve object from cpu_freelist */
+			object = coldfreepointer;
+			coldfreepointer = get_cold_pointer(s, coldfreepointer);
+	
+			/* And put onto the regular freelist */
+			set_freepointer(s, object, page->freelist);
+			page->freelist = object;
+			page->inuse--;
+		}
+		set_cold_free_pointer_from_page(page, NULL);
+	}
+#endif
+
 	while (unlikely(c->freelist)) {
 		void **object;
 
-		tail = 0;	/* Hot objects. Put the slab first */
+#ifdef CONFIG_SILKWORM_SLUG
+		if (s->flags & SLAB_DFREE)
+			tail = 1;
+		else 
+#endif
+			tail = 0;/* Hot objects. Put the slab first */
 
 		/* Retrieve object from cpu_freelist */
 		object = c->freelist;
@@ -1531,7 +2123,7 @@ static int count_free(struct page *page)
 }
 
 static unsigned long count_partial(struct kmem_cache_node *n,
-					int (*get_count)(struct page *))
+				   int (*get_count)(struct page *))
 {
 	unsigned long flags;
 	unsigned long x = 0;
@@ -1539,7 +2131,7 @@ static unsigned long count_partial(struct kmem_cache_node *n,
 
 	spin_lock_irqsave(&n->list_lock, flags);
 	list_for_each_entry(page, &n->partial, lru)
-		x += get_count(page);
+	x += get_count(page);
 	spin_unlock_irqrestore(&n->list_lock, flags);
 	return x;
 }
@@ -1559,11 +2151,11 @@ slab_out_of_memory(struct kmem_cache *s, gfp_t gfpflags, int nid)
 	int node;
 
 	printk(KERN_WARNING
-		"SLUB: Unable to allocate memory on node %d (gfp=0x%x)\n",
-		nid, gfpflags);
+	       "SLUB: Unable to allocate memory on node %d (gfp=0x%x)\n",
+	       nid, gfpflags);
 	printk(KERN_WARNING "  cache: %s, object size: %d, buffer size: %d, "
-		"default order: %d, min order: %d\n", s->name, s->objsize,
-		s->size, oo_order(s->oo), oo_order(s->min));
+	       "default order: %d, min order: %d\n", s->name, s->objsize,
+	       s->size, oo_order(s->oo), oo_order(s->min));
 
 	if (oo_order(s->min) > get_order(s->objsize))
 		printk(KERN_WARNING "  %s debugging increased min order, use "
@@ -1583,8 +2175,8 @@ slab_out_of_memory(struct kmem_cache *s, gfp_t gfpflags, int nid)
 		nr_objs  = node_nr_objs(n);
 
 		printk(KERN_WARNING
-			"  node %d: slabs: %ld, objs: %ld, free: %ld\n",
-			node, nr_slabs, nr_objs, nr_free);
+		       "  node %d: slabs: %ld, objs: %ld, free: %ld\n",
+		       node, nr_slabs, nr_objs, nr_free);
 	}
 }
 
@@ -1611,6 +2203,10 @@ static void *__slab_alloc(struct kmem_cache *s, gfp_t gfpflags, int node,
 {
 	void **object;
 	struct page *new;
+#ifdef CONFIG_SILKWORM_SLUG
+	struct kmem_cache_node *n;
+	unsigned long max_partial;
+#endif
 
 	/* We handle __GFP_ZERO in the caller */
 	gfpflags &= ~__GFP_ZERO;
@@ -1624,30 +2220,65 @@ static void *__slab_alloc(struct kmem_cache *s, gfp_t gfpflags, int node,
 
 	stat(s, ALLOC_REFILL);
 
-load_freelist:
+	load_freelist:
 	object = c->page->freelist;
 	if (unlikely(!object))
 		goto another_slab;
 	if (unlikely(SLABDEBUG && PageSlubDebug(c->page)))
 		goto debug;
+#ifdef CONFIG_SILKWORM_SLUG
+	if (c->page->slab->flags & SLAB_DFREE) 
+		goto dfree;
+#endif
 
 	c->freelist = get_freepointer(s, object);
 	c->page->inuse = c->page->objects;
 	c->page->freelist = NULL;
 	c->node = page_to_nid(c->page);
-unlock_out:
+	unlock_out:
 	slab_unlock(c->page);
 	stat(s, ALLOC_SLOWPATH);
+#ifdef CONFIG_SILKWORM_SLUG
+	if (c->page->slab->flags & SLAB_DFREE) 
+	{
+		/* ensure a minimum number of slabs in the cache for deferred free to work better */
+		n = get_node(s, node);
+		max_partial = max((unsigned long)MAX_PARTIAL, s->dfree_min>>1);
+		if (unlikely(n->nr_partial < max_partial))
+		{
+			if (gfpflags & __GFP_WAIT)
+				local_irq_enable();
+			new = new_slab(s, gfpflags, node);
+			if (gfpflags & __GFP_WAIT)
+				local_irq_disable();
+			if (new)
+			{
+				set_cold_free_pointer_from_page(new, NULL);
+				add_partial(n, new, 0);		/* put new slab in front */
+			}
+		}
+	}
+#endif
 	return object;
 
-another_slab:
+	another_slab:
 	deactivate_slab(s, c);
 
-new_slab:
+	new_slab:
 	new = get_partial(s, gfpflags, node);
 	if (new) {
 		c->page = new;
 		stat(s, ALLOC_FROM_PARTIAL);
+#ifdef CONFIG_SILKWORM_SLUG
+		if (c->page->slab->flags & SLAB_DFREE) 
+		{
+			void *x;
+			
+			x = get_cold_free_pointer_from_page(new);
+			WARN_ON(x);			
+			set_cold_free_pointer_from_page(new, NULL);
+		}
+#endif
 		goto load_freelist;
 	}
 
@@ -1667,15 +2298,25 @@ new_slab:
 		slab_lock(new);
 		__SetPageSlubFrozen(new);
 		c->page = new;
+#ifdef CONFIG_SILKWORM_SLUG
+		if (c->page->slab->flags & SLAB_DFREE) 
+		{
+			set_cold_free_pointer_from_page(new, NULL);
+		}
+		
+#endif
 		goto load_freelist;
 	}
 	if (!(gfpflags & __GFP_NOWARN) && printk_ratelimit())
 		slab_out_of_memory(s, gfpflags, node);
 	return NULL;
-debug:
+	debug:
 	if (!alloc_debug_processing(s, c->page, object, addr))
 		goto another_slab;
 
+#ifdef CONFIG_SILKWORM_SLUG
+	dfree:
+#endif
 	c->page->inuse++;
 	c->page->freelist = get_freepointer(s, object);
 	c->node = -1;
@@ -1693,7 +2334,7 @@ debug:
  * Otherwise we can simply pick the next object from the lockless free list.
  */
 static __always_inline void *slab_alloc(struct kmem_cache *s,
-		gfp_t gfpflags, int node, unsigned long addr)
+					gfp_t gfpflags, int node, unsigned long addr)
 {
 	void **object;
 	struct kmem_cache_cpu *c;
@@ -1720,12 +2361,28 @@ static __always_inline void *slab_alloc(struct kmem_cache *s,
 	}
 	local_irq_restore(flags);
 
+#ifdef CONFIG_SILKWORM_SLUG
+	if (unlikely(gfpflags & __GFP_ZERO) && object)
+	{
+		if ((s->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+			memset((void *)((unsigned long)(object) + cache_line_size()), 0, s->objsize - cache_line_size());
+		else
+			memset(object, 0, s->objsize);
+	}
+#else
 	if (unlikely(gfpflags & __GFP_ZERO) && object)
 		memset(object, 0, s->objsize);
+#endif
 
 	kmemcheck_slab_alloc(s, gfpflags, object, s->objsize);
 	kmemleak_alloc_recursive(object, s->objsize, 1, s->flags, gfpflags);
 
+
+#ifdef CONFIG_SILKWORM_SLUG
+	/* shift object to maintain header */
+	if (object && (s->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+		object = (void *)((unsigned long)object + cache_line_size());
+#endif
 	return object;
 }
 
@@ -1738,6 +2395,32 @@ void *kmem_cache_alloc(struct kmem_cache *s, gfp_t gfpflags)
 	return ret;
 }
 EXPORT_SYMBOL(kmem_cache_alloc);
+
+#ifdef CONFIG_SILKWORM_SLUG
+void *kmem_cache_alloc_brcd(struct kmem_cache *s, gfp_t gfpflags)
+{
+	void *ret = slab_alloc(s, gfpflags, -1, _RET_IP_);
+
+	trace_kmem_cache_alloc(_RET_IP_, ret, s->objsize, s->size, gfpflags);
+
+#ifdef CONFIG_SILKWORM_MLT
+	if (ret) {
+		MLT_param_t mlt_param;
+		mlt_param.s = s;
+		
+		if (ret && (s->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+			mlt_param.ptr = (void *)((unsigned long)ret - cache_line_size());
+		else
+			mlt_param.ptr = ret;
+		
+		MLT_kmalloc_processing(&mlt_param);
+	}
+#endif
+		
+	return ret;
+}
+EXPORT_SYMBOL(kmem_cache_alloc_brcd);
+#endif //CONFIG_SILKWORM_SLUG
 
 #ifdef CONFIG_TRACING
 void *kmem_cache_alloc_notrace(struct kmem_cache *s, gfp_t gfpflags)
@@ -1783,25 +2466,78 @@ static void __slab_free(struct kmem_cache *s, struct page *page,
 {
 	void *prior;
 	void **object = (void *)x;
+#ifdef CONFIG_SILKWORM_SLUG
+	struct kmem_cache_node *n = NULL;
+	unsigned long tmp;
+#endif
 
 	stat(s, FREE_SLOWPATH);
 	slab_lock(page);
 
+#ifdef CONFIG_SILKWORM_SLUG
+	if (s->flags & SLAB_DFREE)
+	{
+		/* do double free checking always */
+		if (check_freelist(s, page, object)) {
+			object_err(s, page, (u8 *)object, "Object already free");
+			goto out_unlock;
+		}
+	}
+#endif
+
 	if (unlikely(SLABDEBUG && PageSlubDebug(page)))
 		goto debug;
 
-checks_ok:
+	checks_ok:
+#ifdef CONFIG_SILKWORM_SLUG
+	if (s->flags & SLAB_DFREE)
+	{
+		if (unlikely(PageSlubFrozen(page))) {
+			prior = get_cold_free_pointer_from_page(page);
+			set_cold_pointer(s, object, prior);
+			set_cold_free_pointer_from_page(page, object);
+			prior = (void *) 0xbeef1234;
+		} else {		
+			prior = page->freelist;
+			set_freepointer(s, object, prior);
+			page->freelist = object;
+			page->inuse--;
+		}
+	} else {
+		prior = page->freelist;
+		set_freepointer(s, object, prior);
+		page->freelist = object;
+		page->inuse--;
+	}
+#else 
 	prior = page->freelist;
 	set_freepointer(s, object, prior);
 	page->freelist = object;
 	page->inuse--;
-
+#endif
 	if (unlikely(PageSlubFrozen(page))) {
 		stat(s, FREE_FROZEN);
 		goto out_unlock;
 	}
 
+#ifdef CONFIG_SILKWORM_SLUG
+	if (s->flags & SLAB_DFREE)
+	{
+		/* start reducing min_partial after dfree age timeout */
+		if (time_after(jiffies, s->tmp_partial_age + SLUG_DFREE_TMOUT))
+		{
+			if (atomic_long_read(&s->tmp_partial) > s->min_partial)
+				atomic_long_set(&s->tmp_partial, s->min_partial);
+		}
+	}
+
+	/* only free slab if we have exceeded number of allowed partial slabs */
+	n = get_node(s, page_to_nid(page));
+	tmp = atomic_long_read(&s->tmp_partial);
+	if (unlikely((!page->inuse) && (n->nr_partial > max(s->min_partial, tmp))))
+#else
 	if (unlikely(!page->inuse))
+#endif
 		goto slab_empty;
 
 	/*
@@ -1809,15 +2545,19 @@ checks_ok:
 	 * then add it.
 	 */
 	if (unlikely(!prior)) {
+#ifdef CONFIG_SILKWORM_SLUG
+		add_partial(n, page, 1);
+#else
 		add_partial(get_node(s, page_to_nid(page)), page, 1);
+#endif
 		stat(s, FREE_ADD_PARTIAL);
 	}
 
-out_unlock:
+	out_unlock:
 	slab_unlock(page);
 	return;
 
-slab_empty:
+	slab_empty:
 	if (prior) {
 		/*
 		 * Slab still on the partial list.
@@ -1830,7 +2570,7 @@ slab_empty:
 	discard_slab(s, page);
 	return;
 
-debug:
+	debug:
 	if (!free_debug_processing(s, page, x, addr))
 		goto out_unlock;
 	goto checks_ok;
@@ -1848,12 +2588,18 @@ debug:
  * with all sorts of special processing.
  */
 static __always_inline void slab_free(struct kmem_cache *s,
-			struct page *page, void *x, unsigned long addr)
+				      struct page *page, void *x, unsigned long addr)
 {
-	void **object = (void *)x;
+	void **object;
 	struct kmem_cache_cpu *c;
 	unsigned long flags;
 
+#ifdef CONFIG_SILKWORM_SLUG
+	/* shift object back over header */
+	if (x && (s->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+		x = (void *)((unsigned long)x - cache_line_size());
+#endif
+	object = (void *)x;
 	kmemleak_free_recursive(x, s->flags);
 	local_irq_save(flags);
 	c = __this_cpu_ptr(s->cpu_slab);
@@ -1914,14 +2660,24 @@ static struct page *get_object_page(const void *x)
  * take the list_lock.
  */
 static int slub_min_order;
+#ifdef CONFIG_SILKWORM_SLUG
+//static int slub_max_order = 4;
 static int slub_max_order = PAGE_ALLOC_COSTLY_ORDER;
+#else
+static int slub_max_order = PAGE_ALLOC_COSTLY_ORDER;
+#endif
 static int slub_min_objects;
 
 /*
  * Merge control. If this is set then no merging of slab caches will occur.
  * (Could be removed. This was introduced to pacify the merge skeptics.)
  */
+#if defined(CONFIG_SILKWORM_MLT) || defined(CONFIG_SILKWORM_SLUG)
+/* do not allow any caches to be merged as MLT book keeping and delayed free is stored in slub metadata */
+static int slub_nomerge = 1;
+#else
 static int slub_nomerge;
+#endif
 
 /*
  * Calculate the order of allocation given an slab object size.
@@ -1949,7 +2705,7 @@ static int slub_nomerge;
  * the smallest order which will fit the object.
  */
 static inline int slab_order(int size, int min_objects,
-				int max_order, int fract_leftover)
+			     int max_order, int fract_leftover)
 {
 	int order;
 	int rem;
@@ -1959,8 +2715,8 @@ static inline int slab_order(int size, int min_objects,
 		return get_order(size * MAX_OBJS_PER_PAGE) - 1;
 
 	for (order = max(min_order,
-				fls(min_objects * size - 1) - PAGE_SHIFT);
-			order <= max_order; order++) {
+			 fls(min_objects * size - 1) - PAGE_SHIFT);
+	    order <= max_order; order++) {
 
 		unsigned long slab_size = PAGE_SIZE << order;
 
@@ -2002,7 +2758,7 @@ static inline int calculate_order(int size)
 		fraction = 16;
 		while (fraction >= 4) {
 			order = slab_order(size, min_objects,
-						slub_max_order, fraction);
+					   slub_max_order, fraction);
 			if (order <= slub_max_order)
 				return order;
 			fraction /= 2;
@@ -2031,7 +2787,7 @@ static inline int calculate_order(int size)
  * Figure out what the alignment of the objects will be.
  */
 static unsigned long calculate_alignment(unsigned long flags,
-		unsigned long align, unsigned long size)
+					 unsigned long align, unsigned long size)
 {
 	/*
 	 * If the user wants hardware cache aligned objects then follow that
@@ -2108,9 +2864,9 @@ static void early_kmem_cache_node_alloc(gfp_t gfpflags, int node)
 	BUG_ON(!page);
 	if (page_to_nid(page) != node) {
 		printk(KERN_ERR "SLUB: Unable to allocate memory from "
-				"node %d\n", node);
+		       "node %d\n", node);
 		printk(KERN_ERR "SLUB: Allocating a useless per node structure "
-				"in order to be able to continue\n");
+		       "in order to be able to continue\n");
 	}
 
 	n = page->freelist;
@@ -2159,7 +2915,7 @@ static int init_kmem_cache_nodes(struct kmem_cache *s, gfp_t gfpflags)
 			continue;
 		}
 		n = kmem_cache_alloc_node(kmalloc_caches,
-						gfpflags, node);
+					  gfpflags, node);
 
 		if (!n) {
 			free_kmem_cache_nodes(s);
@@ -2187,8 +2943,11 @@ static void set_min_partial(struct kmem_cache *s, unsigned long min)
 {
 	if (min < MIN_PARTIAL)
 		min = MIN_PARTIAL;
+#ifndef CONFIG_SILKWORM
+	/* allow slab cache to grow beyond MAX_PARTIAL */
 	else if (min > MAX_PARTIAL)
 		min = MAX_PARTIAL;
+#endif
 	s->min_partial = min;
 }
 
@@ -2217,7 +2976,7 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 	 * then we should never poison the object itself.
 	 */
 	if ((flags & SLAB_POISON) && !(flags & SLAB_DESTROY_BY_RCU) &&
-			!s->ctor)
+	    !s->ctor)
 		s->flags |= __OBJECT_POISON;
 	else
 		s->flags &= ~__OBJECT_POISON;
@@ -2229,7 +2988,11 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 	 * additional word to have some bytes to store Redzone information.
 	 */
 	if ((flags & SLAB_RED_ZONE) && size == s->objsize)
+#ifdef CONFIG_SILKWORM_SLUG
+		size += cache_line_size();
+#else
 		size += sizeof(void *);
+#endif
 #endif
 
 	/*
@@ -2238,8 +3001,12 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 	 */
 	s->inuse = size;
 
-	if (((flags & (SLAB_DESTROY_BY_RCU | SLAB_POISON)) ||
-		s->ctor)) {
+#ifdef CONFIG_SILKWORM_SLUG
+	if (((flags & (SLAB_DESTROY_BY_RCU | SLAB_POISON | SLAB_DFREE)) || s->ctor)) 
+#else
+	if (((flags & (SLAB_DESTROY_BY_RCU | SLAB_POISON)) || s->ctor)) 
+#endif
+	{
 		/*
 		 * Relocate free pointer after the object if it is not
 		 * permitted to overwrite the first word of the object on
@@ -2251,6 +3018,19 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 		s->offset = size;
 		size += sizeof(void *);
 	}
+	
+#ifdef CONFIG_SILKWORM_MLT
+	size += sizeof(MLT_book_keeping_info_t);
+#endif
+
+#ifdef CONFIG_SILKWORM_SLUG
+	if (s->flags & SLAB_DFREE)
+	{
+		size += 2*sizeof(void *);	/* cold free pointer and cold pointer */
+		if (slub_debug & SLAB_POISON)
+			size += sizeof(void *) * SLUG_STACK_SIZE * 2;	/* alloc and free stack frames */
+	}
+#endif
 
 #ifdef CONFIG_SLUB_DEBUG
 	if (flags & SLAB_STORE_USER)
@@ -2268,7 +3048,11 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 		 * corrupted if a user writes before the start
 		 * of the object.
 		 */
+#ifdef CONFIG_SILKWORM_SLUG
+		size += cache_line_size();
+#else
 		size += sizeof(void *);
+#endif
 #endif
 
 	/*
@@ -2317,9 +3101,9 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 }
 
 static int kmem_cache_open(struct kmem_cache *s, gfp_t gfpflags,
-		const char *name, size_t size,
-		size_t align, unsigned long flags,
-		void (*ctor)(void *))
+			   const char *name, size_t size,
+			   size_t align, unsigned long flags,
+			   void (*ctor)(void *))
 {
 	memset(s, 0, kmem_size);
 	s->name = name;
@@ -2327,6 +3111,16 @@ static int kmem_cache_open(struct kmem_cache *s, gfp_t gfpflags,
 	s->objsize = size;
 	s->align = align;
 	s->flags = kmem_cache_flags(size, flags, name, ctor);
+
+#ifdef CONFIG_SILKWORM_SLUG
+	/* 
+	 * We want to add a header in front of the object to catch if 
+	 * the user underruns the buffer. Only do this when poisoning 
+	 * is enabled.
+	 */
+	if ((s->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+		s->objsize += cache_line_size();
+#endif
 
 	if (!calculate_sizes(s, -1))
 		goto error;
@@ -2349,6 +3143,15 @@ static int kmem_cache_open(struct kmem_cache *s, gfp_t gfpflags,
 	 */
 	set_min_partial(s, ilog2(s->size));
 	s->refcount = 1;
+#ifdef CONFIG_SILKWORM_SLUG
+	s->nr_free = 0;
+	spin_lock_init(&s->free_lock);
+	INIT_LIST_HEAD(&s->free);
+	s->dfree_min = MAX_PARTIAL;
+	s->max_objects = 0;
+	s->tmp_partial_age = jiffies;
+	atomic_long_set(&s->tmp_partial, 0);
+#endif
 #ifdef CONFIG_NUMA
 	s->remote_node_defrag_ratio = 1000;
 #endif
@@ -2359,12 +3162,12 @@ static int kmem_cache_open(struct kmem_cache *s, gfp_t gfpflags,
 		return 1;
 
 	free_kmem_cache_nodes(s);
-error:
+	error:
 	if (flags & SLAB_PANIC)
 		panic("Cannot create slab %s size=%lu realsize=%u "
-			"order=%u offset=%u flags=%lx\n",
-			s->name, (unsigned long)size, s->size, oo_order(s->oo),
-			s->offset, flags);
+		      "order=%u offset=%u flags=%lx\n",
+		      s->name, (unsigned long)size, s->size, oo_order(s->oo),
+		      s->offset, flags);
 	return 0;
 }
 
@@ -2413,7 +3216,7 @@ const char *kmem_cache_name(struct kmem_cache *s)
 EXPORT_SYMBOL(kmem_cache_name);
 
 static void list_slab_objects(struct kmem_cache *s, struct page *page,
-							const char *text)
+			      const char *text)
 {
 #ifdef CONFIG_SLUB_DEBUG
 	void *addr = page_address(page);
@@ -2424,13 +3227,13 @@ static void list_slab_objects(struct kmem_cache *s, struct page *page,
 	slab_err(s, page, "%s", text);
 	slab_lock(page);
 	for_each_free_object(p, s, page->freelist)
-		set_bit(slab_index(p, s, addr), map);
+	set_bit(slab_index(p, s, addr), map);
 
 	for_each_object(p, s, addr, page->objects) {
 
 		if (!test_bit(slab_index(p, s, addr), map)) {
 			printk(KERN_ERR "INFO: Object 0x%p @offset=%tu\n",
-							p, p - addr);
+			       p, p - addr);
 			print_tracking(s, p);
 		}
 	}
@@ -2454,7 +3257,7 @@ static void free_partial(struct kmem_cache *s, struct kmem_cache_node *n)
 			n->nr_partial--;
 		} else {
 			list_slab_objects(s, page,
-				"Objects remaining on kmem_cache_close()");
+					  "Objects remaining on kmem_cache_close()");
 		}
 	}
 	spin_unlock_irqrestore(&n->list_lock, flags);
@@ -2494,8 +3297,19 @@ void kmem_cache_destroy(struct kmem_cache *s)
 		up_write(&slub_lock);
 		if (kmem_cache_close(s)) {
 			printk(KERN_ERR "SLUB %s: %s called for cache that "
-				"still has objects.\n", s->name, __func__);
+			       "still has objects.\n", s->name, __func__);
+#ifdef CONFIG_SILKWORM
+			{
+				int save_message_loglevel;
+				save_message_loglevel = default_message_loglevel;
+				default_message_loglevel = minimum_console_loglevel;
+				printk(KERN_EMERG "The following is the CURRENT Stack:\n");
+				dump_stack();
+				default_message_loglevel = save_message_loglevel;
+			}
+#else
 			dump_stack();
+#endif
 		}
 		if (s->flags & SLAB_DESTROY_BY_RCU)
 			rcu_barrier();
@@ -2511,6 +3325,11 @@ EXPORT_SYMBOL(kmem_cache_destroy);
 
 struct kmem_cache kmalloc_caches[KMALLOC_CACHES] __cacheline_aligned;
 EXPORT_SYMBOL(kmalloc_caches);
+
+#ifdef CONFIG_SILKWORM_SLUG
+struct kmem_cache kmalloc_brcd_caches[KMALLOC_CACHES] __cacheline_aligned;
+EXPORT_SYMBOL(kmalloc_brcd_caches);
+#endif
 
 static int __init setup_slub_min_order(char *str)
 {
@@ -2549,19 +3368,24 @@ static int __init setup_slub_nomerge(char *str)
 __setup("slub_nomerge", setup_slub_nomerge);
 
 static struct kmem_cache *create_kmalloc_cache(struct kmem_cache *s,
-		const char *name, int size, gfp_t gfp_flags)
+					       const char *name, int size, gfp_t gfp_flags)
 {
 	unsigned int flags = 0;
 
 	if (gfp_flags & SLUB_DMA)
 		flags = SLAB_CACHE_DMA;
 
+#ifdef CONFIG_SILKWORM_SLUG
+	flags |= SLAB_DFREE;
+	if (size >= 1024)
+		flags |= SLAB_HWCACHE_ALIGN;
+#endif
 	/*
 	 * This function is called with IRQs disabled during early-boot on
 	 * single CPU so there's no need to take slub_lock here.
 	 */
 	if (!kmem_cache_open(s, gfp_flags, name, size, ARCH_KMALLOC_MINALIGN,
-								flags, NULL))
+			     flags, NULL))
 		goto panic;
 
 	list_add(&s->list, &slab_caches);
@@ -2570,7 +3394,7 @@ static struct kmem_cache *create_kmalloc_cache(struct kmem_cache *s,
 		goto panic;
 	return s;
 
-panic:
+	panic:
 	panic("Creation of kmalloc slab %s size=%d failed.\n", name, size);
 }
 
@@ -2639,7 +3463,7 @@ static noinline struct kmem_cache *dma_kmalloc_cache(int index, gfp_t flags)
 		slabflags |= __SYSFS_ADD_DEFERRED;
 
 	if (!text || !kmem_cache_open(s, flags, text,
-			realsize, ARCH_KMALLOC_MINALIGN, slabflags, NULL)) {
+				      realsize, ARCH_KMALLOC_MINALIGN, slabflags, NULL)) {
 		s->size = 0;
 		kfree(text);
 		goto unlock_out;
@@ -2651,9 +3475,9 @@ static noinline struct kmem_cache *dma_kmalloc_cache(int index, gfp_t flags)
 	if (slab_state >= SYSFS)
 		schedule_work(&sysfs_add_work);
 
-unlock_out:
+	unlock_out:
 	up_write(&slub_lock);
-out:
+	out:
 	return kmalloc_caches_dma[index];
 }
 #endif
@@ -2665,38 +3489,38 @@ out:
  * fls.
  */
 static s8 size_index[24] = {
-	3,	/* 8 */
-	4,	/* 16 */
-	5,	/* 24 */
-	5,	/* 32 */
-	6,	/* 40 */
-	6,	/* 48 */
-	6,	/* 56 */
-	6,	/* 64 */
-	1,	/* 72 */
-	1,	/* 80 */
-	1,	/* 88 */
-	1,	/* 96 */
-	7,	/* 104 */
-	7,	/* 112 */
-	7,	/* 120 */
-	7,	/* 128 */
-	2,	/* 136 */
-	2,	/* 144 */
-	2,	/* 152 */
-	2,	/* 160 */
-	2,	/* 168 */
-	2,	/* 176 */
-	2,	/* 184 */
-	2	/* 192 */
+	3,  /* 8 */
+	4,  /* 16 */
+	5,  /* 24 */
+	5,  /* 32 */
+	6,  /* 40 */
+	6,  /* 48 */
+	6,  /* 56 */
+	6,  /* 64 */
+	1,  /* 72 */
+	1,  /* 80 */
+	1,  /* 88 */
+	1,  /* 96 */
+	7,  /* 104 */
+	7,  /* 112 */
+	7,  /* 120 */
+	7,  /* 128 */
+	2,  /* 136 */
+	2,  /* 144 */
+	2,  /* 152 */
+	2,  /* 160 */
+	2,  /* 168 */
+	2,  /* 176 */
+	2,  /* 184 */
+	2   /* 192 */
 };
 
 static inline int size_index_elem(size_t bytes)
 {
-	return (bytes - 1) / 8;
+	return(bytes - 1) / 8;
 }
 
-static struct kmem_cache *get_slab(size_t size, gfp_t flags)
+static struct kmem_cache *get_slab(size_t size, gfp_t flags) 
 {
 	int index;
 
@@ -2716,26 +3540,112 @@ static struct kmem_cache *get_slab(size_t size, gfp_t flags)
 	return &kmalloc_caches[index];
 }
 
+#ifdef CONFIG_SILKWORM_MLT
+struct kmem_cache *get_cachep(size_t size, gfp_t flags) 
+{
+	return get_slab(size, flags);
+}
+#endif
+
 void *__kmalloc(size_t size, gfp_t flags)
 {
 	struct kmem_cache *s;
 	void *ret;
+#ifdef CONFIG_SILKWORM_MLT
+	MLT_param_t mlt_param;
+#endif
 
-	if (unlikely(size > SLUB_MAX_SIZE))
+	if (unlikely(size > SLUB_MAX_SIZE)) {
 		return kmalloc_large(size, flags);
+	} else {
 
-	s = get_slab(size, flags);
+		s = get_slab(size, flags);
 
-	if (unlikely(ZERO_OR_NULL_PTR(s)))
-		return s;
+		if (unlikely(ZERO_OR_NULL_PTR(s)))
+			return s;
 
-	ret = slab_alloc(s, flags, -1, _RET_IP_);
+		ret = slab_alloc(s, flags, -1, _RET_IP_);
+		trace_kmalloc(_RET_IP_, ret, size, s->size, flags);
+	}
 
-	trace_kmalloc(_RET_IP_, ret, size, s->size, flags);
+#ifdef CONFIG_SILKWORM_MLT
+	if (ret) {
+		mlt_param.s = s;
+#ifdef CONFIG_SILKWORM_SLUG
+		if (ret && (s->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+			mlt_param.ptr = (void *)((unsigned long)ret - cache_line_size());
+		else
+#endif
+		mlt_param.ptr = ret;
+		MLT_kmalloc_processing(&mlt_param);
+	}
+#endif
+
 
 	return ret;
 }
 EXPORT_SYMBOL(__kmalloc);
+
+#ifdef CONFIG_SILKWORM_SLUG
+static struct kmem_cache *get_slab_brcd(size_t size, gfp_t flags) 
+{
+	int index;
+
+	if (size <= 192) {
+		if (!size)
+			return ZERO_SIZE_PTR;
+
+		index = size_index[size_index_elem(size)];
+	} else
+		index = fls(size - 1);
+
+#ifdef CONFIG_ZONE_DMA
+	if (unlikely((flags & SLUB_DMA)))
+		return dma_kmalloc_cache(index, flags);
+
+#endif
+	return &kmalloc_brcd_caches[index];
+}
+
+void *__kmalloc_brcd(size_t size, gfp_t flags)
+{
+	struct kmem_cache *s;
+	void *ret;
+#ifdef CONFIG_SILKWORM_MLT
+	MLT_param_t mlt_param;
+#endif
+
+	if (unlikely(size > SLUB_MAX_SIZE)) {
+		return kmalloc_large(size, flags);
+	} else {
+
+		s = get_slab_brcd(size, flags);
+
+		if (unlikely(ZERO_OR_NULL_PTR(s)))
+			return s;
+
+		ret = slab_alloc(s, flags, -1, _RET_IP_);
+		trace_kmalloc(_RET_IP_, ret, size, s->size, flags);
+	}
+
+#ifdef CONFIG_SILKWORM_MLT
+	if (ret) {
+		mlt_param.s = s;
+#ifdef CONFIG_SILKWORM_SLUG
+		if (ret && (s->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+			mlt_param.ptr = (void *)((unsigned long)ret - cache_line_size());
+		else
+#endif
+		mlt_param.ptr = ret;
+		MLT_kmalloc_processing(&mlt_param);
+	}
+#endif
+
+
+	return ret;
+}
+EXPORT_SYMBOL(__kmalloc_brcd);
+#endif
 
 static void *kmalloc_large_node(size_t size, gfp_t flags, int node)
 {
@@ -2749,6 +3659,7 @@ static void *kmalloc_large_node(size_t size, gfp_t flags, int node)
 
 	kmemleak_alloc(ptr, size, 1, flags);
 	return ptr;
+
 }
 
 #ifdef CONFIG_NUMA
@@ -2797,6 +3708,11 @@ size_t ksize(const void *object)
 	}
 	s = page->slab;
 
+#ifdef CONFIG_SILKWORM_SLUG
+	if ((s->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+		return (s->objsize - cache_line_size());
+#endif
+
 #ifdef CONFIG_SLUB_DEBUG
 	/*
 	 * Debugging requires use of the padding between object
@@ -2806,6 +3722,12 @@ size_t ksize(const void *object)
 		return s->objsize;
 
 #endif
+
+#ifdef CONFIG_SILKWORM_MLT
+	/* if MLT is enabled, the book keeping is stored in the metadata */
+	return s->inuse;
+#endif
+
 	/*
 	 * If we have the need to store the freelist pointer
 	 * back there or track user information then we can
@@ -2813,6 +3735,7 @@ size_t ksize(const void *object)
 	 */
 	if (s->flags & (SLAB_DESTROY_BY_RCU | SLAB_STORE_USER))
 		return s->inuse;
+
 	/*
 	 * Else we can use all the padding etc for the allocation
 	 */
@@ -2824,6 +3747,9 @@ void kfree(const void *x)
 {
 	struct page *page;
 	void *object = (void *)x;
+#ifdef CONFIG_SILKWORM_MLT
+        MLT_param_t mlt_param;
+#endif
 
 	trace_kfree(_RET_IP_, x);
 
@@ -2837,6 +3763,17 @@ void kfree(const void *x)
 		put_page(page);
 		return;
 	}
+#ifdef CONFIG_SILKWORM_MLT
+        mlt_param.s = page->slab;
+#ifdef CONFIG_SILKWORM_SLUG
+	if (object && (page->slab->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+		mlt_param.ptr = (void *)((unsigned long)object - cache_line_size());
+	else
+#endif
+        mlt_param.ptr = object;
+	MLT_kfree_processing(&mlt_param);
+#endif
+
 	slab_free(page->slab, page, object, _RET_IP_);
 }
 EXPORT_SYMBOL(kfree);
@@ -2860,8 +3797,11 @@ int kmem_cache_shrink(struct kmem_cache *s)
 	struct page *t;
 	int objects = oo_objects(s->max);
 	struct list_head *slabs_by_inuse =
-		kmalloc(sizeof(struct list_head) * objects, GFP_KERNEL);
+	kmalloc(sizeof(struct list_head) * objects, GFP_KERNEL);
 	unsigned long flags;
+#ifdef CONFIG_SILKWORM_SLUG
+	unsigned long tmp = 0;
+#endif
 
 	if (!slabs_by_inuse)
 		return -ENOMEM;
@@ -2878,6 +3818,19 @@ int kmem_cache_shrink(struct kmem_cache *s)
 
 		spin_lock_irqsave(&n->list_lock, flags);
 
+#ifdef CONFIG_SILKWORM_SLUG
+		if (s->flags & SLAB_DFREE)
+		{
+			/* start reducing min_partial after dfree age timeout */
+			if (time_after(jiffies, s->tmp_partial_age + SLUG_DFREE_TMOUT))
+			{
+				if (atomic_long_read(&s->tmp_partial) > s->min_partial)
+					atomic_long_set(&s->tmp_partial, s->min_partial);
+			}
+			tmp = atomic_long_read(&s->tmp_partial);
+		}
+		slub_validate_off = 1;
+#endif
 		/*
 		 * Build lists indexed by the items in use in each slab.
 		 *
@@ -2885,7 +3838,13 @@ int kmem_cache_shrink(struct kmem_cache *s)
 		 * list_lock. page->inuse here is the upper limit.
 		 */
 		list_for_each_entry_safe(page, t, &n->partial, lru) {
+#ifdef CONFIG_SILKWORM_SLUG
+			int cnt = 0;
+			/* only allow full slabs to be freed when the number of partial pages exceed min_partial */
+			if (!page->inuse && (n->nr_partial > max(s->min_partial, tmp)) && slab_trylock(page)) {
+#else
 			if (!page->inuse && slab_trylock(page)) {
+#endif
 				/*
 				 * Must hold slab lock here because slab_free
 				 * may have freed the last object and be
@@ -2894,10 +3853,14 @@ int kmem_cache_shrink(struct kmem_cache *s)
 				list_del(&page->lru);
 				n->nr_partial--;
 				slab_unlock(page);
+#ifdef CONFIG_SILKWORM_SLUG
+				if ((cnt++ % 100) == 0)
+					kick_watchdog();
+#endif
 				discard_slab(s, page);
 			} else {
 				list_move(&page->lru,
-				slabs_by_inuse + page->inuse);
+					  slabs_by_inuse + page->inuse);
 			}
 		}
 
@@ -2907,7 +3870,9 @@ int kmem_cache_shrink(struct kmem_cache *s)
 		 */
 		for (i = objects - 1; i >= 0; i--)
 			list_splice(slabs_by_inuse + i, n->partial.prev);
-
+#ifdef CONFIG_SILKWORM_SLUG
+		slub_validate_off = 0;
+#endif
 		spin_unlock_irqrestore(&n->list_lock, flags);
 	}
 
@@ -2923,7 +3888,7 @@ static int slab_mem_going_offline_callback(void *arg)
 
 	down_read(&slub_lock);
 	list_for_each_entry(s, &slab_caches, list)
-		kmem_cache_shrink(s);
+	kmem_cache_shrink(s);
 	up_read(&slub_lock);
 
 	return 0;
@@ -2999,7 +3964,7 @@ static int slab_mem_going_online_callback(void *arg)
 		init_kmem_cache_node(n, s);
 		s->node[nid] = n;
 	}
-out:
+	out:
 	up_read(&slub_lock);
 	return ret;
 }
@@ -3036,6 +4001,52 @@ static int slab_memory_callback(struct notifier_block *self,
 /********************************************************************
  *			Basic setup of slabs
  *******************************************************************/
+#ifdef CONFIG_SILKWORM
+static void slug_add_partial(struct kmem_cache_node *n,
+			struct page *page, int tail)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&n->list_lock, flags);
+	n->nr_partial++;
+	if (tail)
+		list_add_tail(&page->lru, &n->partial);
+	else
+		list_add(&page->lru, &n->partial);
+	spin_unlock_irqrestore(&n->list_lock, flags);
+}
+
+void slub_prime_cache(struct kmem_cache *s)
+{
+	struct kmem_cache_node *n;
+	struct page *new;
+	unsigned long tot_slabs = 0;
+
+	n = get_node(s, -1);
+	while (n->nr_partial < s->min_partial)
+	{
+		new = new_slab(s, GFP_KERNEL, -1);
+		if (new)
+		{
+#ifdef CONFIG_SILKWORM_SLUG
+			set_cold_free_pointer_from_page(new, NULL);
+#endif
+			slug_add_partial(n, new, 1);
+			tot_slabs++;
+		}
+	}
+#ifdef CONFIG_SILKWORM_SLUG
+	atomic_long_set(&s->tmp_partial, tot_slabs);
+#endif
+}
+#endif
+
+#ifdef CONFIG_SILKWORM_SLUG
+void slub_dfree_size(struct kmem_cache *s, unsigned long min)
+{
+	s->min_partial = min / ((1 << oo_order(s->oo)) * PAGE_SIZE);
+	s->dfree_min = s->min_partial;
+}
+#endif
 
 void __init kmem_cache_init(void)
 {
@@ -3049,7 +4060,7 @@ void __init kmem_cache_init(void)
 	 * kmem_cache_open for slab_state == DOWN.
 	 */
 	create_kmalloc_cache(&kmalloc_caches[0], "kmem_cache_node",
-		sizeof(struct kmem_cache_node), GFP_NOWAIT);
+			     sizeof(struct kmem_cache_node), GFP_NOWAIT);
 	kmalloc_caches[0].refcount = -1;
 	caches++;
 
@@ -3062,20 +4073,41 @@ void __init kmem_cache_init(void)
 	/* Caches that are not of the two-to-the-power-of size */
 	if (KMALLOC_MIN_SIZE <= 32) {
 		create_kmalloc_cache(&kmalloc_caches[1],
-				"kmalloc-96", 96, GFP_NOWAIT);
+				     "kmalloc-96", 96, GFP_NOWAIT);
 		caches++;
 	}
 	if (KMALLOC_MIN_SIZE <= 64) {
 		create_kmalloc_cache(&kmalloc_caches[2],
-				"kmalloc-192", 192, GFP_NOWAIT);
+				     "kmalloc-192", 192, GFP_NOWAIT);
 		caches++;
 	}
 
 	for (i = KMALLOC_SHIFT_LOW; i < SLUB_PAGE_SHIFT; i++) {
 		create_kmalloc_cache(&kmalloc_caches[i],
-			"kmalloc", 1 << i, GFP_NOWAIT);
+				     "kmalloc", 1 << i, GFP_NOWAIT);
 		caches++;
 	}
+
+#ifdef CONFIG_SILKWORM_SLUG
+#ifndef CONFIG_DFREE_ON
+	if (slub_debug & SLAB_POISON)
+#endif
+	{
+		if (KMALLOC_MIN_SIZE <= 32) {
+			create_kmalloc_cache(&kmalloc_brcd_caches[1],
+					     "kmalloc_brcd-96", 96, GFP_NOWAIT);
+		}
+		if (KMALLOC_MIN_SIZE <= 64) {
+			create_kmalloc_cache(&kmalloc_brcd_caches[2],
+					     "kmalloc_brcd-192", 192, GFP_NOWAIT);
+		}
+
+		for (i = KMALLOC_SHIFT_LOW; i < SLUB_PAGE_SHIFT; i++) {
+			create_kmalloc_cache(&kmalloc_brcd_caches[i],
+					     "kmalloc_brcd", 1 << i, GFP_NOWAIT);
+		}
+	}
+#endif
 
 
 	/*
@@ -3089,8 +4121,22 @@ void __init kmem_cache_init(void)
 	 * Make sure that nothing crazy happens if someone starts tinkering
 	 * around with ARCH_KMALLOC_MINALIGN
 	 */
+	
+#ifdef CONFIG_SILKWORM_SLUG
+#ifndef CONFIG_DFREE_ON
+	if (slub_debug & SLAB_POISON)
+#endif
+	{
+		for (i=1; i<KMALLOC_CACHES; i++)
+		{
+			slub_dfree_size(&kmalloc_brcd_caches[i], KMALLOC_PRIME_SIZE);			
+			slub_dfree_size(&kmalloc_caches[i], KMALLOC_PRIME_SIZE);			
+		}
+	}
+#endif
+
 	BUILD_BUG_ON(KMALLOC_MIN_SIZE > 256 ||
-		(KMALLOC_MIN_SIZE & (KMALLOC_MIN_SIZE - 1)));
+		     (KMALLOC_MIN_SIZE & (KMALLOC_MIN_SIZE - 1)));
 
 	for (i = 8; i < KMALLOC_MIN_SIZE; i += 8) {
 		int elem = size_index_elem(i);
@@ -3121,24 +4167,80 @@ void __init kmem_cache_init(void)
 	/* Provide the correct kmalloc names now that the caches are up */
 	for (i = KMALLOC_SHIFT_LOW; i < SLUB_PAGE_SHIFT; i++)
 		kmalloc_caches[i]. name =
-			kasprintf(GFP_NOWAIT, "kmalloc-%d", 1 << i);
+		kasprintf(GFP_NOWAIT, "kmalloc-%d", 1 << i);
+#ifdef CONFIG_SILKWORM_SLUG
+#ifndef CONFIG_DFREE_ON
+	if (slub_debug & SLAB_POISON)
+#endif
+	{
+		for (i = KMALLOC_SHIFT_LOW; i < SLUB_PAGE_SHIFT; i++)
+			kmalloc_brcd_caches[i]. name = kasprintf(GFP_NOWAIT, "kmalloc_brcd-%d", 1 << i);
+	}
+#endif
 
 #ifdef CONFIG_SMP
 	register_cpu_notifier(&slab_notifier);
 #endif
 #ifdef CONFIG_NUMA
 	kmem_size = offsetof(struct kmem_cache, node) +
-				nr_node_ids * sizeof(struct kmem_cache_node *);
+		    nr_node_ids * sizeof(struct kmem_cache_node *);
 #else
 	kmem_size = sizeof(struct kmem_cache);
 #endif
 
 	printk(KERN_INFO
-		"SLUB: Genslabs=%d, HWalign=%d, Order=%d-%d, MinObjects=%d,"
-		" CPUs=%d, Nodes=%d\n",
-		caches, cache_line_size(),
-		slub_min_order, slub_max_order, slub_min_objects,
-		nr_cpu_ids, nr_node_ids);
+	       "SLUB 0x%x: Genslabs=%d, HWalign=%d, Order=%d-%d, MinObjects=%d,"
+	       " CPUs=%d, Nodes=%d\n",
+	       slub_debug, caches, cache_line_size(),
+	       slub_min_order, slub_max_order, slub_min_objects,
+	       nr_cpu_ids, nr_node_ids);
+
+#ifdef CONFIG_SILKWORM_SLUG
+#ifndef CONFIG_DFREE_ON
+	if (slub_debug & SLAB_POISON)
+#endif
+	{
+		// prime the caches 
+		struct kmem_cache *s;
+		struct kernel_symbol *ks;
+
+		/* fill up the caches */
+		printk(KERN_EMERG "SLUB: dfree enabled\n");
+		printk(KERN_EMERG "PRIMING SLUB: main caches\n");
+		for (i=1; i<KMALLOC_CACHES; i++)
+		{
+			s = &kmalloc_brcd_caches[i];
+			if (s->flags & SLAB_DFREE) 
+				slub_prime_cache(s);
+			s = &kmalloc_caches[i];
+			if (s->flags & SLAB_DFREE) 
+				slub_prime_cache(s);
+		}
+		
+		/* change the __kmalloc module export symbol to the brocade version to separate the memory allocations */
+		ks = lookup_symbol("__kmalloc", __start___ksymtab, __stop___ksymtab);
+		if (ks)
+		{
+			printk(KERN_INFO "SLUB: real __kmalloc at 0x%lx\n", (unsigned long)__kmalloc);
+			printk(KERN_EMERG "SLUB: export __kmalloc at 0x%lx changed to 0x%lx\n", ks->value, (unsigned long)__kmalloc_brcd);
+			ks->value = (unsigned long)__kmalloc_brcd;
+		}
+		ks = lookup_symbol("vmalloc", __start___ksymtab, __stop___ksymtab);
+		if (ks)
+		{
+			printk(KERN_INFO "SLUB: real vmalloc at 0x%lx\n", (unsigned long)__kmalloc);
+			printk(KERN_EMERG "SLUB: export vmalloc at 0x%lx changed to 0x%lx\n", ks->value, (unsigned long)vmalloc_brcd);
+			ks->value = (unsigned long)vmalloc_brcd;
+		}
+		ks = lookup_symbol("vfree", __start___ksymtab, __stop___ksymtab);
+		if (ks)
+		{
+			printk(KERN_INFO "SLUB: real vfree at 0x%lx\n", (unsigned long)__kmalloc);
+			printk(KERN_EMERG "SLUB: export vfree at 0x%lx changed to 0x%lx\n", ks->value, (unsigned long)vfree_brcd);
+			ks->value = (unsigned long)vfree_brcd;
+		}
+	}
+#endif
 }
 
 void __init kmem_cache_init_late(void)
@@ -3166,8 +4268,8 @@ static int slab_unmergeable(struct kmem_cache *s)
 }
 
 static struct kmem_cache *find_mergeable(size_t size,
-		size_t align, unsigned long flags, const char *name,
-		void (*ctor)(void *))
+					 size_t align, unsigned long flags, const char *name,
+					 void (*ctor)(void *)) 
 {
 	struct kmem_cache *s;
 
@@ -3190,7 +4292,7 @@ static struct kmem_cache *find_mergeable(size_t size,
 			continue;
 
 		if ((flags & SLUB_MERGE_SAME) != (s->flags & SLUB_MERGE_SAME))
-				continue;
+			continue;
 		/*
 		 * Check if alignment is compatible.
 		 * Courtesy of Adrian Drzewiecki
@@ -3207,7 +4309,7 @@ static struct kmem_cache *find_mergeable(size_t size,
 }
 
 struct kmem_cache *kmem_cache_create(const char *name, size_t size,
-		size_t align, unsigned long flags, void (*ctor)(void *))
+		   size_t align, unsigned long flags, void (*ctor)(void *)) 
 {
 	struct kmem_cache *s;
 
@@ -3238,7 +4340,7 @@ struct kmem_cache *kmem_cache_create(const char *name, size_t size,
 	s = kmalloc(kmem_size, GFP_KERNEL);
 	if (s) {
 		if (kmem_cache_open(s, GFP_KERNEL, name,
-				size, align, flags, ctor)) {
+				    size, align, flags, ctor)) {
 			list_add(&s->list, &slab_caches);
 			up_write(&slub_lock);
 			if (sysfs_slab_add(s)) {
@@ -3254,7 +4356,7 @@ struct kmem_cache *kmem_cache_create(const char *name, size_t size,
 	}
 	up_write(&slub_lock);
 
-err:
+	err:
 	if (flags & SLAB_PANIC)
 		panic("Cannot create slabcache %s\n", name);
 	else
@@ -3269,7 +4371,7 @@ EXPORT_SYMBOL(kmem_cache_create);
  * necessary.
  */
 static int __cpuinit slab_cpuup_callback(struct notifier_block *nfb,
-		unsigned long action, void *hcpu)
+					 unsigned long action, void *hcpu)
 {
 	long cpu = (long)hcpu;
 	struct kmem_cache *s;
@@ -3295,51 +4397,88 @@ static int __cpuinit slab_cpuup_callback(struct notifier_block *nfb,
 }
 
 static struct notifier_block __cpuinitdata slab_notifier = {
-	.notifier_call = slab_cpuup_callback
+    .notifier_call = slab_cpuup_callback
 };
-
 #endif
 
 void *__kmalloc_track_caller(size_t size, gfp_t gfpflags, unsigned long caller)
 {
 	struct kmem_cache *s;
 	void *ret;
+#ifdef CONFIG_SILKWORM_MLT
+        MLT_param_t mlt_param;
+#endif
 
-	if (unlikely(size > SLUB_MAX_SIZE))
+	if (unlikely(size > SLUB_MAX_SIZE)) {
 		return kmalloc_large(size, gfpflags);
+	} else {
 
-	s = get_slab(size, gfpflags);
+		s = get_slab(size, gfpflags);
 
-	if (unlikely(ZERO_OR_NULL_PTR(s)))
-		return s;
+		if (unlikely(ZERO_OR_NULL_PTR(s)))
+			return s;
 
-	ret = slab_alloc(s, gfpflags, -1, caller);
+		ret = slab_alloc(s, gfpflags, -1, caller);
 
-	/* Honor the call site pointer we recieved. */
-	trace_kmalloc(caller, ret, size, s->size, gfpflags);
+		/* Honor the call site pointer we recieved. */
+		trace_kmalloc(caller, ret, size, s->size, gfpflags);
+	}
 
+
+#ifdef CONFIG_SILKWORM_MLT
+	if (ret) {
+                mlt_param.s = s;
+#ifdef CONFIG_SILKWORM_SLUG
+		if (ret && (s->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+			mlt_param.ptr = (void *)((unsigned long)ret - cache_line_size());
+		else
+#endif
+                mlt_param.ptr = ret;
+                MLT_kmalloc_processing(&mlt_param);
+	}
+#endif
 	return ret;
 }
 
 void *__kmalloc_node_track_caller(size_t size, gfp_t gfpflags,
-					int node, unsigned long caller)
+				  int node, unsigned long caller)
 {
 	struct kmem_cache *s;
 	void *ret;
+#ifdef CONFIG_SILKWORM_MLT
+        MLT_param_t mlt_param;
 
-	if (unlikely(size > SLUB_MAX_SIZE))
-		return kmalloc_large_node(size, gfpflags, node);
+	// just to remvoe compiler warning
+	s = NULL;
+#endif
 
-	s = get_slab(size, gfpflags);
+	if (unlikely(size > SLUB_MAX_SIZE)) {
+		ret = kmalloc_large_node(size, gfpflags, node);
+	} else {
 
-	if (unlikely(ZERO_OR_NULL_PTR(s)))
-		return s;
+		s = get_slab(size, gfpflags);
 
-	ret = slab_alloc(s, gfpflags, node, caller);
+		if (unlikely(ZERO_OR_NULL_PTR(s)))
+			return s;
 
-	/* Honor the call site pointer we recieved. */
-	trace_kmalloc_node(caller, ret, size, s->size, gfpflags, node);
+		ret = slab_alloc(s, gfpflags, node, caller);
 
+		/* Honor the call site pointer we recieved. */
+		trace_kmalloc_node(caller, ret, size, s->size, gfpflags, node);
+	}
+
+#ifdef CONFIG_SILKWORM_MLT
+	if (ret) {
+                mlt_param.s = s;
+#ifdef CONFIG_SILKWORM_SLUG
+		if (ret && (s->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+			mlt_param.ptr = (void *)((unsigned long)ret - cache_line_size());
+		else
+#endif
+                mlt_param.ptr = ret;
+                MLT_kmalloc_processing(&mlt_param);
+	}
+#endif
 	return ret;
 }
 
@@ -3355,13 +4494,13 @@ static int count_total(struct page *page)
 }
 
 static int validate_slab(struct kmem_cache *s, struct page *page,
-						unsigned long *map)
+			 unsigned long *map)
 {
 	void *p;
 	void *addr = page_address(page);
 
 	if (!check_slab(s, page) ||
-			!on_freelist(s, page, NULL))
+	    !on_freelist(s, page, NULL))
 		return 0;
 
 	/* Now we know that a valid freelist exists */
@@ -3374,35 +4513,107 @@ static int validate_slab(struct kmem_cache *s, struct page *page,
 	}
 
 	for_each_object(p, s, addr, page->objects)
-		if (!test_bit(slab_index(p, s, addr), map))
-			if (!check_object(s, page, p, 1))
-				return 0;
+	if (!test_bit(slab_index(p, s, addr), map))
+		if (!check_object(s, page, p, 1))
+			return 0;
 	return 1;
 }
 
 static void validate_slab_slab(struct kmem_cache *s, struct page *page,
-						unsigned long *map)
+			       unsigned long *map)
 {
 	if (slab_trylock(page)) {
-		validate_slab(s, page, map);
+		if (likely(!PageSlubFrozen(page))) 
+			validate_slab(s, page, map);
 		slab_unlock(page);
 	} else
 		printk(KERN_INFO "SLUB %s: Skipped busy slab 0x%p\n",
-			s->name, page);
+		       s->name, page);
 
+#ifndef CONFIG_SILKWORM_SLUG
 	if (s->flags & DEBUG_DEFAULT_FLAGS) {
 		if (!PageSlubDebug(page))
 			printk(KERN_ERR "SLUB %s: SlubDebug not set "
-				"on slab 0x%p\n", s->name, page);
+			       "on slab 0x%p\n", s->name, page);
 	} else {
 		if (PageSlubDebug(page))
 			printk(KERN_ERR "SLUB %s: SlubDebug set on "
-				"slab 0x%p\n", s->name, page);
+			       "slab 0x%p\n", s->name, page);
 	}
+#endif
+}
+  
+#ifdef CONFIG_SILKWORM
+#define SLUB_MAX_VALIDATE	100000
+void validate_slab_list(struct kmem_cache *s, struct kmem_cache_node *n, unsigned long *map, struct list_head *head)
+{
+	struct page *page;
+	unsigned long flags, pos, cnt;
+	struct list_head *list;
+
+	/* 
+	 * To scan the list safely, we need to hold the list lock
+	 * the entire time. But if we hold the lock for too long
+	 * the watchdog will fire on large caches. Instead, we'll go 
+	 * through 200 at a time, release the lock, and then rescan
+	 * the list skipping those we validated already. Some slabs
+	 * may not be fully validated this way, but that is better than
+	 * crashing or having a watchdog timeout.
+	 */
+	cnt = 0;
+	spin_lock_irqsave(&n->list_lock, flags);
+	while (cnt < SLUB_MAX_VALIDATE)
+	{
+		pos = 0;
+		list = head->next;
+
+		/* skip what we already done */
+		while ((pos < cnt) && (list != head))
+		{
+			pos++;
+			list = list->next;
+		}
+
+		/* continue walking the list and validating */
+		while (list != head)
+		{
+			page = list_entry(list, struct page, lru);
+			validate_slab_slab(s, page, map);
+			if ((cnt++ % 200) == 0)
+			{
+				spin_unlock_irqrestore(&n->list_lock, flags);
+				kick_watchdog();	/* allows other cpus in now */
+				spin_lock_irqsave(&n->list_lock, flags);
+				break;
+			}
+			list = list->next;
+		}
+		if (list == head)
+			break;
+	}
+	spin_unlock_irqrestore(&n->list_lock, flags);
 }
 
 static int validate_slab_node(struct kmem_cache *s,
-		struct kmem_cache_node *n, unsigned long *map)
+			      struct kmem_cache_node *n, unsigned long *map)
+{
+	validate_slab_list(s, n, map, &n->partial);
+
+#ifdef CONFIG_SILKWORM_SLUG
+	if (s->flags & SLAB_DFREE) 
+		validate_slab_list(s, n, map, &s->free);
+#endif
+	if (!(s->flags & SLAB_STORE_USER))
+		goto out;
+
+	validate_slab_list(s, n, map, &n->full);
+
+	out:
+	return 0;
+}
+#else
+static int validate_slab_node(struct kmem_cache *s,
+			      struct kmem_cache_node *n, unsigned long *map)
 {
 	unsigned long count = 0;
 	struct page *page;
@@ -3416,7 +4627,7 @@ static int validate_slab_node(struct kmem_cache *s,
 	}
 	if (count != n->nr_partial)
 		printk(KERN_ERR "SLUB %s: %ld partial slabs counted but "
-			"counter=%ld\n", s->name, count, n->nr_partial);
+		       "counter=%ld\n", s->name, count, n->nr_partial);
 
 	if (!(s->flags & SLAB_STORE_USER))
 		goto out;
@@ -3427,20 +4638,21 @@ static int validate_slab_node(struct kmem_cache *s,
 	}
 	if (count != atomic_long_read(&n->nr_slabs))
 		printk(KERN_ERR "SLUB: %s %ld slabs counted but "
-			"counter=%ld\n", s->name, count,
-			atomic_long_read(&n->nr_slabs));
+		       "counter=%ld\n", s->name, count,
+		       atomic_long_read(&n->nr_slabs));
 
-out:
+	out:
 	spin_unlock_irqrestore(&n->list_lock, flags);
 	return count;
 }
+#endif
 
 static long validate_slab_cache(struct kmem_cache *s)
 {
 	int node;
 	unsigned long count = 0;
 	unsigned long *map = kmalloc(BITS_TO_LONGS(oo_objects(s->max)) *
-				sizeof(unsigned long), GFP_KERNEL);
+				     sizeof(unsigned long), GFP_KERNEL);
 
 	if (!map)
 		return -ENOMEM;
@@ -3467,7 +4679,7 @@ static void resiliency_test(void)
 	p = kzalloc(16, GFP_KERNEL);
 	p[16] = 0x12;
 	printk(KERN_ERR "\n1. kmalloc-16: Clobber Redzone/next pointer"
-			" 0x12->0x%p\n\n", p + 16);
+	       " 0x12->0x%p\n\n", p + 16);
 
 	validate_slab_cache(kmalloc_caches + 4);
 
@@ -3475,18 +4687,18 @@ static void resiliency_test(void)
 	p = kzalloc(32, GFP_KERNEL);
 	p[32 + sizeof(void *)] = 0x34;
 	printk(KERN_ERR "\n2. kmalloc-32: Clobber next pointer/next slab"
-			" 0x34 -> -0x%p\n", p);
+	       " 0x34 -> -0x%p\n", p);
 	printk(KERN_ERR
-		"If allocated object is overwritten then not detectable\n\n");
+	       "If allocated object is overwritten then not detectable\n\n");
 
 	validate_slab_cache(kmalloc_caches + 5);
 	p = kzalloc(64, GFP_KERNEL);
 	p += 64 + (get_cycles() & 0xff) * sizeof(void *);
 	*p = 0x56;
 	printk(KERN_ERR "\n3. kmalloc-64: corrupting random byte 0x56->0x%p\n",
-									p);
+	       p);
 	printk(KERN_ERR
-		"If allocated object is overwritten then not detectable\n\n");
+	       "If allocated object is overwritten then not detectable\n\n");
 	validate_slab_cache(kmalloc_caches + 6);
 
 	printk(KERN_ERR "\nB. Corruption after free\n");
@@ -3500,7 +4712,7 @@ static void resiliency_test(void)
 	kfree(p);
 	p[50] = 0x9a;
 	printk(KERN_ERR "\n2. kmalloc-256: Clobber 50th byte 0x9a->0x%p\n\n",
-			p);
+	       p);
 	validate_slab_cache(kmalloc_caches + 8);
 
 	p = kzalloc(512, GFP_KERNEL);
@@ -3540,7 +4752,7 @@ static void free_loc_track(struct loc_track *t)
 {
 	if (t->max)
 		free_pages((unsigned long)t->loc,
-			get_order(sizeof(struct location) * t->max));
+			   get_order(sizeof(struct location) * t->max));
 }
 
 static int alloc_loc_track(struct loc_track *t, unsigned long max, gfp_t flags)
@@ -3564,7 +4776,7 @@ static int alloc_loc_track(struct loc_track *t, unsigned long max, gfp_t flags)
 }
 
 static int add_location(struct loc_track *t, struct kmem_cache *s,
-				const struct track *track)
+			const struct track *track)
 {
 	long start, end, pos;
 	struct location *l;
@@ -3640,7 +4852,7 @@ static int add_location(struct loc_track *t, struct kmem_cache *s,
 }
 
 static void process_slab(struct loc_track *t, struct kmem_cache *s,
-		struct page *page, enum track_item alloc)
+			 struct page *page, enum track_item alloc)
 {
 	void *addr = page_address(page);
 	DECLARE_BITMAP(map, page->objects);
@@ -3648,23 +4860,23 @@ static void process_slab(struct loc_track *t, struct kmem_cache *s,
 
 	bitmap_zero(map, page->objects);
 	for_each_free_object(p, s, page->freelist)
-		set_bit(slab_index(p, s, addr), map);
+	set_bit(slab_index(p, s, addr), map);
 
 	for_each_object(p, s, addr, page->objects)
-		if (!test_bit(slab_index(p, s, addr), map))
-			add_location(t, s, get_track(s, p, alloc));
+	if (!test_bit(slab_index(p, s, addr), map))
+		add_location(t, s, get_track(s, p, alloc));
 }
 
 static int list_locations(struct kmem_cache *s, char *buf,
-					enum track_item alloc)
+			  enum track_item alloc)
 {
 	int len = 0;
 	unsigned long i;
-	struct loc_track t = { 0, 0, NULL };
+	struct loc_track t = { 0, 0, NULL};
 	int node;
 
 	if (!alloc_loc_track(&t, PAGE_SIZE / sizeof(struct location),
-			GFP_TEMPORARY))
+			     GFP_TEMPORARY))
 		return sprintf(buf, "Out of memory\n");
 
 	/* Push back cpu slabs */
@@ -3680,9 +4892,9 @@ static int list_locations(struct kmem_cache *s, char *buf,
 
 		spin_lock_irqsave(&n->list_lock, flags);
 		list_for_each_entry(page, &n->partial, lru)
-			process_slab(&t, s, page, alloc);
+		process_slab(&t, s, page, alloc);
 		list_for_each_entry(page, &n->full, lru)
-			process_slab(&t, s, page, alloc);
+		process_slab(&t, s, page, alloc);
 		spin_unlock_irqrestore(&n->list_lock, flags);
 	}
 
@@ -3700,33 +4912,33 @@ static int list_locations(struct kmem_cache *s, char *buf,
 
 		if (l->sum_time != l->min_time) {
 			len += sprintf(buf + len, " age=%ld/%ld/%ld",
-				l->min_time,
-				(long)div_u64(l->sum_time, l->count),
-				l->max_time);
+				       l->min_time,
+				       (long)div_u64(l->sum_time, l->count),
+				       l->max_time);
 		} else
 			len += sprintf(buf + len, " age=%ld",
-				l->min_time);
+				       l->min_time);
 
 		if (l->min_pid != l->max_pid)
 			len += sprintf(buf + len, " pid=%ld-%ld",
-				l->min_pid, l->max_pid);
+				       l->min_pid, l->max_pid);
 		else
 			len += sprintf(buf + len, " pid=%ld",
-				l->min_pid);
+				       l->min_pid);
 
 		if (num_online_cpus() > 1 &&
-				!cpumask_empty(to_cpumask(l->cpus)) &&
-				len < PAGE_SIZE - 60) {
+		    !cpumask_empty(to_cpumask(l->cpus)) &&
+		    len < PAGE_SIZE - 60) {
 			len += sprintf(buf + len, " cpus=");
 			len += cpulist_scnprintf(buf + len, PAGE_SIZE - len - 50,
 						 to_cpumask(l->cpus));
 		}
 
 		if (nr_online_nodes > 1 && !nodes_empty(l->nodes) &&
-				len < PAGE_SIZE - 60) {
+		    len < PAGE_SIZE - 60) {
 			len += sprintf(buf + len, " nodes=");
 			len += nodelist_scnprintf(buf + len, PAGE_SIZE - len - 50,
-					l->nodes);
+						  l->nodes);
 		}
 
 		len += sprintf(buf + len, "\n");
@@ -3739,11 +4951,11 @@ static int list_locations(struct kmem_cache *s, char *buf,
 }
 
 enum slab_stat_type {
-	SL_ALL,			/* All slabs */
-	SL_PARTIAL,		/* Only partially allocated slabs */
-	SL_CPU,			/* Only slabs used for cpu caches */
-	SL_OBJECTS,		/* Determine allocated objects not slabs */
-	SL_TOTAL		/* Determine object capacity not slabs */
+	SL_ALL,		/* All slabs */
+	SL_PARTIAL,	/* Only partially allocated slabs */
+	SL_CPU,		/* Only slabs used for cpu caches */
+	SL_OBJECTS,	/* Determine allocated objects not slabs */
+	SL_TOTAL	/* Determine object capacity not slabs */
 };
 
 #define SO_ALL		(1 << SL_ALL)
@@ -3753,7 +4965,7 @@ enum slab_stat_type {
 #define SO_TOTAL	(1 << SL_TOTAL)
 
 static ssize_t show_slab_objects(struct kmem_cache *s,
-			    char *buf, unsigned long flags)
+				 char *buf, unsigned long flags)
 {
 	unsigned long total = 0;
 	int node;
@@ -3776,8 +4988,8 @@ static ssize_t show_slab_objects(struct kmem_cache *s,
 				continue;
 
 			if (c->page) {
-					if (flags & SO_TOTAL)
-						x = c->page->objects;
+				if (flags & SO_TOTAL)
+					x = c->page->objects;
 				else if (flags & SO_OBJECTS)
 					x = c->page->inuse;
 				else
@@ -3794,11 +5006,11 @@ static ssize_t show_slab_objects(struct kmem_cache *s,
 		for_each_node_state(node, N_NORMAL_MEMORY) {
 			struct kmem_cache_node *n = get_node(s, node);
 
-		if (flags & SO_TOTAL)
-			x = atomic_long_read(&n->total_objects);
-		else if (flags & SO_OBJECTS)
-			x = atomic_long_read(&n->total_objects) -
-				count_partial(n, count_free);
+			if (flags & SO_TOTAL)
+				x = atomic_long_read(&n->total_objects);
+			else if (flags & SO_OBJECTS)
+				x = atomic_long_read(&n->total_objects) -
+				    count_partial(n, count_free);
 
 			else
 				x = atomic_long_read(&n->nr_slabs);
@@ -3823,9 +5035,9 @@ static ssize_t show_slab_objects(struct kmem_cache *s,
 	x = sprintf(buf, "%lu", total);
 #ifdef CONFIG_NUMA
 	for_each_node_state(node, N_NORMAL_MEMORY)
-		if (nodes[node])
-			x += sprintf(buf + x, " N%d=%lu",
-					node, nodes[node]);
+	if (nodes[node])
+		x += sprintf(buf + x, " N%d=%lu",
+			     node, nodes[node]);
 #endif
 	kfree(nodes);
 	return x + sprintf(buf + x, "\n");
@@ -3888,7 +5100,7 @@ static ssize_t objs_per_slab_show(struct kmem_cache *s, char *buf)
 SLAB_ATTR_RO(objs_per_slab);
 
 static ssize_t order_store(struct kmem_cache *s,
-				const char *buf, size_t length)
+			   const char *buf, size_t length)
 {
 	unsigned long order;
 	int err;
@@ -3929,6 +5141,88 @@ static ssize_t min_partial_store(struct kmem_cache *s, const char *buf,
 	return length;
 }
 SLAB_ATTR(min_partial);
+
+#ifdef CONFIG_SILKWORM_SLUG
+static ssize_t dfree_min_show(struct kmem_cache *s, char *buf)
+{
+	return sprintf(buf, "%lu\n", s->dfree_min);
+}
+
+static ssize_t dfree_min_store(struct kmem_cache *s, const char *buf,
+				 size_t length)
+{
+	unsigned long val;
+	int err;
+
+	err = strict_strtoul(buf, 10, &val);
+	if (err)
+		return err;
+
+	s->dfree_min = val;
+	return length;
+}
+SLAB_ATTR(dfree_min);
+
+static ssize_t max_objects_show(struct kmem_cache *s, char *buf)
+{
+	return sprintf(buf, "%lu\n", s->max_objects);
+}
+
+static ssize_t max_objects_store(struct kmem_cache *s, const char *buf,
+				 size_t length)
+{
+	unsigned long val;
+	int err;
+
+	err = strict_strtoul(buf, 10, &val);
+	if (err)
+		return err;
+
+	s->max_objects = val;
+	return length;
+}
+SLAB_ATTR(max_objects);
+
+static ssize_t tmp_partial_show(struct kmem_cache *s, char *buf)
+{
+	return sprintf(buf, "%lu\n", atomic_long_read(&s->tmp_partial));
+}
+
+static ssize_t tmp_partial_store(struct kmem_cache *s, const char *buf,
+				 size_t length)
+{
+	unsigned long val;
+	int err;
+
+	err = strict_strtoul(buf, 10, &val);
+	if (err)
+		return err;
+
+	atomic_long_set(&s->tmp_partial, val);
+	return length;
+}
+SLAB_ATTR(tmp_partial);
+
+static ssize_t tmp_partial_age_show(struct kmem_cache *s, char *buf)
+{
+	return sprintf(buf, "%lu\n", s->tmp_partial_age);
+}
+
+static ssize_t tmp_partial_age_store(struct kmem_cache *s, const char *buf,
+				 size_t length)
+{
+	unsigned long val;
+	int err;
+
+	err = strict_strtoul(buf, 10, &val);
+	if (err)
+		return err;
+
+	s->tmp_partial_age = val;
+	return length;
+}
+SLAB_ATTR(tmp_partial_age);
+#endif
 
 static ssize_t ctor_show(struct kmem_cache *s, char *buf)
 {
@@ -3989,7 +5283,7 @@ static ssize_t sanity_checks_show(struct kmem_cache *s, char *buf)
 }
 
 static ssize_t sanity_checks_store(struct kmem_cache *s,
-				const char *buf, size_t length)
+				   const char *buf, size_t length)
 {
 	s->flags &= ~SLAB_DEBUG_FREE;
 	if (buf[0] == '1')
@@ -4004,7 +5298,7 @@ static ssize_t trace_show(struct kmem_cache *s, char *buf)
 }
 
 static ssize_t trace_store(struct kmem_cache *s, const char *buf,
-							size_t length)
+			   size_t length)
 {
 	s->flags &= ~SLAB_TRACE;
 	if (buf[0] == '1')
@@ -4020,7 +5314,7 @@ static ssize_t failslab_show(struct kmem_cache *s, char *buf)
 }
 
 static ssize_t failslab_store(struct kmem_cache *s, const char *buf,
-							size_t length)
+			      size_t length)
 {
 	s->flags &= ~SLAB_FAILSLAB;
 	if (buf[0] == '1')
@@ -4036,7 +5330,7 @@ static ssize_t reclaim_account_show(struct kmem_cache *s, char *buf)
 }
 
 static ssize_t reclaim_account_store(struct kmem_cache *s,
-				const char *buf, size_t length)
+				     const char *buf, size_t length)
 {
 	s->flags &= ~SLAB_RECLAIM_ACCOUNT;
 	if (buf[0] == '1')
@@ -4071,7 +5365,7 @@ static ssize_t red_zone_show(struct kmem_cache *s, char *buf)
 }
 
 static ssize_t red_zone_store(struct kmem_cache *s,
-				const char *buf, size_t length)
+			      const char *buf, size_t length)
 {
 	if (any_slab_objects(s))
 		return -EBUSY;
@@ -4090,7 +5384,7 @@ static ssize_t poison_show(struct kmem_cache *s, char *buf)
 }
 
 static ssize_t poison_store(struct kmem_cache *s,
-				const char *buf, size_t length)
+			    const char *buf, size_t length)
 {
 	if (any_slab_objects(s))
 		return -EBUSY;
@@ -4128,7 +5422,7 @@ static ssize_t validate_show(struct kmem_cache *s, char *buf)
 }
 
 static ssize_t validate_store(struct kmem_cache *s,
-			const char *buf, size_t length)
+			      const char *buf, size_t length)
 {
 	int ret = -EINVAL;
 
@@ -4147,7 +5441,7 @@ static ssize_t shrink_show(struct kmem_cache *s, char *buf)
 }
 
 static ssize_t shrink_store(struct kmem_cache *s,
-			const char *buf, size_t length)
+			    const char *buf, size_t length)
 {
 	if (buf[0] == '1') {
 		int rc = kmem_cache_shrink(s);
@@ -4183,7 +5477,7 @@ static ssize_t remote_node_defrag_ratio_show(struct kmem_cache *s, char *buf)
 }
 
 static ssize_t remote_node_defrag_ratio_store(struct kmem_cache *s,
-				const char *buf, size_t length)
+					      const char *buf, size_t length)
 {
 	unsigned long ratio;
 	int err;
@@ -4235,7 +5529,7 @@ static void clear_stat(struct kmem_cache *s, enum stat_item si)
 	int cpu;
 
 	for_each_online_cpu(cpu)
-		per_cpu_ptr(s->cpu_slab, cpu)->stat[si] = 0;
+	per_cpu_ptr(s->cpu_slab, cpu)->stat[si] = 0;
 }
 
 #define STAT_ATTR(si, text) 					\
@@ -4279,6 +5573,12 @@ static struct attribute *slab_attrs[] = {
 	&objs_per_slab_attr.attr,
 	&order_attr.attr,
 	&min_partial_attr.attr,
+#ifdef CONFIG_SILKWORM_SLUG
+	&dfree_min_attr.attr,
+	&max_objects_attr.attr,
+	&tmp_partial_attr.attr,
+	&tmp_partial_age_attr.attr,
+#endif
 	&objects_attr.attr,
 	&objects_partial_attr.attr,
 	&total_objects_attr.attr,
@@ -4338,8 +5638,8 @@ static struct attribute_group slab_attr_group = {
 };
 
 static ssize_t slab_attr_show(struct kobject *kobj,
-				struct attribute *attr,
-				char *buf)
+			      struct attribute *attr,
+			      char *buf)
 {
 	struct slab_attribute *attribute;
 	struct kmem_cache *s;
@@ -4357,8 +5657,8 @@ static ssize_t slab_attr_show(struct kobject *kobj,
 }
 
 static ssize_t slab_attr_store(struct kobject *kobj,
-				struct attribute *attr,
-				const char *buf, size_t len)
+			       struct attribute *attr,
+			       const char *buf, size_t len)
 {
 	struct slab_attribute *attribute;
 	struct kmem_cache *s;
@@ -4388,8 +5688,8 @@ static const struct sysfs_ops slab_sysfs_ops = {
 };
 
 static struct kobj_type slab_ktype = {
-	.sysfs_ops = &slab_sysfs_ops,
-	.release = kmem_cache_release
+    .sysfs_ops = &slab_sysfs_ops,
+    .release = kmem_cache_release
 };
 
 static int uevent_filter(struct kset *kset, struct kobject *kobj)
@@ -4551,7 +5851,7 @@ static int __init slab_sysfs_init(void)
 		err = sysfs_slab_add(s);
 		if (err)
 			printk(KERN_ERR "SLUB: Unable to add boot slab %s"
-						" to sysfs\n", s->name);
+			       " to sysfs\n", s->name);
 	}
 
 	while (alias_list) {
@@ -4561,7 +5861,7 @@ static int __init slab_sysfs_init(void)
 		err = sysfs_slab_alias(al->s, al->name);
 		if (err)
 			printk(KERN_ERR "SLUB: Unable to add boot slab alias"
-					" %s to sysfs\n", s->name);
+			       " %s to sysfs\n", s->name);
 		kfree(al);
 	}
 
@@ -4582,7 +5882,11 @@ static void print_slabinfo_header(struct seq_file *m)
 	seq_puts(m, "# name            <active_objs> <num_objs> <objsize> "
 		 "<objperslab> <pagesperslab>");
 	seq_puts(m, " : tunables <limit> <batchcount> <sharedfactor>");
+#ifdef CONFIG_SILKWORM_SLUG
+	seq_puts(m, " : slabdata <active_slabs> <sharedavail> <nr_free> <max objs> <tmp_partial>");
+#else
 	seq_puts(m, " : slabdata <active_slabs> <num_slabs> <sharedavail>");
+#endif
 	seq_putc(m, '\n');
 }
 
@@ -4616,6 +5920,9 @@ static int s_show(struct seq_file *m, void *p)
 	unsigned long nr_free = 0;
 	struct kmem_cache *s;
 	int node;
+#ifdef CONFIG_SILKWORM_SLUG
+	unsigned long tmp_partial;
+#endif
 
 	s = list_entry(p, struct kmem_cache, list);
 
@@ -4632,13 +5939,19 @@ static int s_show(struct seq_file *m, void *p)
 	}
 
 	nr_inuse = nr_objs - nr_free;
+#ifdef CONFIG_SILKWORM_SLUG
+	tmp_partial = atomic_long_read(&s->tmp_partial);
+#endif
 
 	seq_printf(m, "%-17s %6lu %6lu %6u %4u %4d", s->name, nr_inuse,
 		   nr_objs, s->size, oo_objects(s->oo),
 		   (1 << oo_order(s->oo)));
 	seq_printf(m, " : tunables %4u %4u %4u", 0, 0, 0);
-	seq_printf(m, " : slabdata %6lu %6lu %6lu", nr_slabs, nr_slabs,
-		   0UL);
+#ifdef CONFIG_SILKWORM_SLUG
+	seq_printf(m, " : slabdata %6lu %6lu %6lu %6lu %6lu", nr_slabs, 0UL, s->nr_free, s->max_objects, tmp_partial);
+#else
+	seq_printf(m, " : slabdata %6lu %6lu %6lu", nr_slabs, nr_slabs, 0UL);
+#endif
 	seq_putc(m, '\n');
 	return 0;
 }
@@ -4656,10 +5969,10 @@ static int slabinfo_open(struct inode *inode, struct file *file)
 }
 
 static const struct file_operations proc_slabinfo_operations = {
-	.open		= slabinfo_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= seq_release,
+	.open       = slabinfo_open,
+	.read       = seq_read,
+	.llseek     = seq_lseek,
+	.release    = seq_release,
 };
 
 static int __init slab_proc_init(void)
