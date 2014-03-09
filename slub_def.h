@@ -12,6 +12,11 @@
 #include <linux/kobject.h>
 #include <linux/kmemtrace.h>
 #include <linux/kmemleak.h>
+#ifdef CONFIG_SILKWORM_MLT
+#include <linux/mlt_inc.h>
+#endif
+
+#define CONFIG_SILKWORM_SLUG	1	/* enable deferred free */
 
 enum stat_item {
 	ALLOC_FASTPATH,		/* Allocation from cpu slab */
@@ -32,7 +37,7 @@ enum stat_item {
 	DEACTIVATE_TO_TAIL,	/* Cpu slab was moved to the tail of partials */
 	DEACTIVATE_REMOTE_FREES,/* Slab contained remotely freed objects */
 	ORDER_FALLBACK,		/* Number of times fallback was necessary */
-	NR_SLUB_STAT_ITEMS };
+	NR_SLUB_STAT_ITEMS};
 
 struct kmem_cache_cpu {
 	void **freelist;	/* Pointer to first free per cpu object */
@@ -80,7 +85,7 @@ struct kmem_cache {
 	struct kmem_cache_order_objects min;
 	gfp_t allocflags;	/* gfp flags to use on each alloc */
 	int refcount;		/* Refcount for slab cache destroy */
-	void (*ctor)(void *);
+	void (*ctor) (void *);
 	int inuse;		/* Offset to metadata */
 	int align;		/* Alignment */
 	unsigned long min_partial;
@@ -89,6 +94,8 @@ struct kmem_cache {
 #ifdef CONFIG_SLUB_DEBUG
 	struct kobject kobj;	/* For sysfs */
 #endif
+
+
 
 #ifdef CONFIG_NUMA
 	/*
@@ -100,7 +107,27 @@ struct kmem_cache {
 	/* Avoid an extra cache line for UP */
 	struct kmem_cache_node local_node;
 #endif
+
+#ifdef CONFIG_SILKWORM_SLUG
+	spinlock_t free_lock;		/* Protect free list and nr_free */
+	unsigned long nr_free;		/* count of slabs on the deferred slab free list */
+	struct list_head free;		/* deferred slab free list */
+	unsigned long dfree_min;	/* deferred free min partial */
+	unsigned long max_objects; 	/* most number of objects in cache */
+	atomic_long_t tmp_partial;	/* temporary min partial level to hold when number of slabs increase */
+	unsigned long tmp_partial_age;	/* jiffy of last slab increase */
+#endif
 };
+
+#ifdef CONFIG_SILKWORM_MLT
+struct kmem_cache *get_cachep (size_t size, gfp_t flags);
+static __always_inline MLT_book_keeping_info_t *get_mlt_offset(struct kmem_cache *s, void *object);
+#define obj_size_api(cachep) ((cachep)->objsize)
+#endif
+
+#ifdef CONFIG_SILKWORM
+int kmem_cache_objects(struct kmem_cache *s);
+#endif
 
 /*
  * Kmalloc subsystem.
@@ -122,9 +149,16 @@ struct kmem_cache {
  * This should be dropped to PAGE_SIZE / 2 once the page allocator
  * "fastpath" becomes competitive with the slab allocator fastpaths.
  */
+#ifdef CONFIG_SILKWORM_SLUG
+/* add 16K kmalloc cache */
+//#define SLUB_MAX_SIZE (4 * PAGE_SIZE)
+//#define SLUB_PAGE_SHIFT (PAGE_SHIFT + 3)
 #define SLUB_MAX_SIZE (2 * PAGE_SIZE)
-
 #define SLUB_PAGE_SHIFT (PAGE_SHIFT + 2)
+#else
+#define SLUB_MAX_SIZE (2 * PAGE_SIZE)
+#define SLUB_PAGE_SHIFT (PAGE_SHIFT + 2)
+#endif
 
 #ifdef CONFIG_ZONE_DMA
 #define SLUB_DMA __GFP_DMA
@@ -146,7 +180,7 @@ extern struct kmem_cache kmalloc_caches[KMALLOC_CACHES];
  * Sorry that the following has to be that ugly but some versions of GCC
  * have trouble with constant propagation and loops.
  */
-static __always_inline int kmalloc_index(size_t size)
+static __always_inline int kmalloc_index (size_t size)
 {
 	if (!size)
 		return 0;
@@ -158,29 +192,29 @@ static __always_inline int kmalloc_index(size_t size)
 		return 1;
 	if (KMALLOC_MIN_SIZE <= 64 && size > 128 && size <= 192)
 		return 2;
-	if (size <=          8) return 3;
-	if (size <=         16) return 4;
-	if (size <=         32) return 5;
-	if (size <=         64) return 6;
-	if (size <=        128) return 7;
-	if (size <=        256) return 8;
-	if (size <=        512) return 9;
-	if (size <=       1024) return 10;
-	if (size <=   2 * 1024) return 11;
-	if (size <=   4 * 1024) return 12;
+	if (size <= 	   8) return 3;
+	if (size <= 	  16) return 4;
+	if (size <= 	  32) return 5;
+	if (size <= 	  64) return 6;
+	if (size <= 	 128) return 7;
+	if (size <= 	 256) return 8;
+	if (size <= 	 512) return 9;
+	if (size <= 	1024) return 10;
+	if (size <= 2 * 1024) return 11;
+	if (size <= 4 * 1024) return 12;
 /*
  * The following is only needed to support architectures with a larger page
  * size than 4k.
  */
-	if (size <=   8 * 1024) return 13;
-	if (size <=  16 * 1024) return 14;
-	if (size <=  32 * 1024) return 15;
-	if (size <=  64 * 1024) return 16;
+	if (size <= 8   * 1024) return 13;
+	if (size <= 16  * 1024) return 14;
+	if (size <= 32  * 1024)	return 15;
+	if (size <= 64  * 1024)	return 16;
 	if (size <= 128 * 1024) return 17;
-	if (size <= 256 * 1024) return 18;
-	if (size <= 512 * 1024) return 19;
+	if (size <= 256 * 1024)	return 18;
+	if (size <= 512 * 1024)	return 19;
 	if (size <= 1024 * 1024) return 20;
-	if (size <=  2 * 1024 * 1024) return 21;
+	if (size <= 2 * 1024 * 1024) return 21;
 	return -1;
 
 /*
@@ -198,9 +232,9 @@ static __always_inline int kmalloc_index(size_t size)
  * This ought to end up with a global pointer to the right cache
  * in kmalloc_caches.
  */
-static __always_inline struct kmem_cache *kmalloc_slab(size_t size)
+static __always_inline struct kmem_cache *kmalloc_slab (size_t size)
 {
-	int index = kmalloc_index(size);
+	int index = kmalloc_index (size);
 
 	if (index == 0)
 		return NULL;
@@ -208,91 +242,130 @@ static __always_inline struct kmem_cache *kmalloc_slab(size_t size)
 	return &kmalloc_caches[index];
 }
 
-void *kmem_cache_alloc(struct kmem_cache *, gfp_t);
-void *__kmalloc(size_t size, gfp_t flags);
+void *kmem_cache_alloc (struct kmem_cache *, gfp_t);
+void *__kmalloc (size_t size, gfp_t flags);
+
+#ifdef CONFIG_SILKWORM_SLUG
+void *kmem_cache_alloc_brcd (struct kmem_cache *s, gfp_t);
+#endif
 
 #ifdef CONFIG_TRACING
-extern void *kmem_cache_alloc_notrace(struct kmem_cache *s, gfp_t gfpflags);
+extern void *kmem_cache_alloc_notrace (struct kmem_cache *s, gfp_t gfpflags);
 #else
 static __always_inline void *
-kmem_cache_alloc_notrace(struct kmem_cache *s, gfp_t gfpflags)
+kmem_cache_alloc_notrace (struct kmem_cache *s, gfp_t gfpflags)
 {
-	return kmem_cache_alloc(s, gfpflags);
+	return kmem_cache_alloc (s, gfpflags);
 }
 #endif
 
-static __always_inline void *kmalloc_large(size_t size, gfp_t flags)
+static __always_inline void *kmalloc_large (size_t size, gfp_t flags)
 {
-	unsigned int order = get_order(size);
-	void *ret = (void *) __get_free_pages(flags | __GFP_COMP, order);
+	unsigned int order = get_order (size);
+	void *ret = (void *) __get_free_pages (flags | __GFP_COMP, order);
 
-	kmemleak_alloc(ret, size, 1, flags);
-	trace_kmalloc(_THIS_IP_, ret, size, PAGE_SIZE << order, flags);
+	kmemleak_alloc (ret, size, 1, flags);
+	trace_kmalloc (_THIS_IP_, ret, size, PAGE_SIZE << order, flags);
+	kmemleak_alloc (ret, size, 1, flags);
 
 	return ret;
 }
 
-static __always_inline void *kmalloc(size_t size, gfp_t flags)
+static __always_inline void *
+kmalloc (size_t size, gfp_t flags)
 {
 	void *ret;
+#ifdef CONFIG_SILKWORM_MLT
+        MLT_param_t mlt_param;
+#endif
 
-	if (__builtin_constant_p(size)) {
-		if (size > SLUB_MAX_SIZE)
-			return kmalloc_large(size, flags);
-
-		if (!(flags & SLUB_DMA)) {
-			struct kmem_cache *s = kmalloc_slab(size);
-
-			if (!s)
-				return ZERO_SIZE_PTR;
-
-			ret = kmem_cache_alloc_notrace(s, flags);
-
-			trace_kmalloc(_THIS_IP_, ret, size, s->size, flags);
-
-			return ret;
+#ifdef CONFIG_SILKWORM_SLUG
+	return __kmalloc (size, flags);
+#endif
+	if (__builtin_constant_p (size)) {
+		if (size > SLUB_MAX_SIZE) {
+		    return kmalloc_large (size, flags);
 		}
-	}
-	return __kmalloc(size, flags);
+		else {
+			if (!(flags & SLUB_DMA)) {
+				      struct kmem_cache *s =
+					      kmalloc_slab (size);
+			
+				      if (!s)
+					      return ZERO_SIZE_PTR;
+			
+				      ret = kmem_cache_alloc_notrace (s,
+								      flags);
+			
+#ifdef CONFIG_SILKWORM_MLT
+				      if (ret) {
+                				mlt_param.s = s;
+                				mlt_param.ptr = ret;
+                				MLT_kmalloc_processing(&mlt_param);
+				      }
+#endif
+			
+				      trace_kmalloc (_THIS_IP_, ret, size,
+						     s->size, flags);
+			
+				      return ret;
+			}
+		}
+	  }
+
+	return __kmalloc (size, flags);
 }
 
 #ifdef CONFIG_NUMA
-void *__kmalloc_node(size_t size, gfp_t flags, int node);
-void *kmem_cache_alloc_node(struct kmem_cache *, gfp_t flags, int node);
+void *__kmalloc_node (size_t size, gfp_t flags, int node);
+void *kmem_cache_alloc_node (struct kmem_cache *, gfp_t flags, int node);
 
 #ifdef CONFIG_TRACING
-extern void *kmem_cache_alloc_node_notrace(struct kmem_cache *s,
-					   gfp_t gfpflags,
-					   int node);
+extern void *kmem_cache_alloc_node_notrace (struct kmem_cache *s,
+					    gfp_t gfpflags, 
+					    int node);
 #else
 static __always_inline void *
-kmem_cache_alloc_node_notrace(struct kmem_cache *s,
-			      gfp_t gfpflags,
-			      int node)
+kmem_cache_alloc_node_notrace (struct kmem_cache *s, gfp_t gfpflags, int node)
 {
-	return kmem_cache_alloc_node(s, gfpflags, node);
+	return kmem_cache_alloc_node (s, gfpflags, node);
 }
 #endif
 
-static __always_inline void *kmalloc_node(size_t size, gfp_t flags, int node)
+static __always_inline void *kmalloc_node (size_t size, gfp_t flags, int node)
 {
 	void *ret;
 
-	if (__builtin_constant_p(size) &&
-		size <= SLUB_MAX_SIZE && !(flags & SLUB_DMA)) {
-			struct kmem_cache *s = kmalloc_slab(size);
+	if (__builtin_constant_p (size) &&
+	    size <= SLUB_MAX_SIZE && !(flags & SLUB_DMA)) {
+		  struct kmem_cache *s = kmalloc_slab (size);
 
-		if (!s)
-			return ZERO_SIZE_PTR;
+		  if (!s)
+			  return ZERO_SIZE_PTR;
 
-		ret = kmem_cache_alloc_node_notrace(s, flags, node);
+		  ret = kmem_cache_alloc_node_notrace (s, flags, node);
 
-		trace_kmalloc_node(_THIS_IP_, ret,
-				   size, s->size, flags, node);
+		  trace_kmalloc_node (_THIS_IP_, ret,
+				      size, s->size, flags, node);
 
-		return ret;
+		  return ret;
 	}
-	return __kmalloc_node(size, flags, node);
+	return __kmalloc_node (size, flags, node);
+}
+#endif
+
+#ifdef CONFIG_SILKWORM_MLT
+
+static __always_inline MLT_book_keeping_info_t *get_mlt_offset(struct kmem_cache *s, void *object)
+{
+	MLT_book_keeping_info_t *p;
+
+	if (s->offset)
+                p = object + s->offset + sizeof(void *);
+        else
+                p = object + s->inuse;
+	
+	return p;
 }
 #endif
 
