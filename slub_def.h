@@ -15,8 +15,51 @@
 #ifdef CONFIG_SILKWORM_MLT
 #include <linux/mlt_inc.h>
 #endif
+#ifdef CONFIG_SILKWORM_MLT_KMALLOC_LARGE
+#include <linux/mlt_kl_inc.h>
+#endif
+
+#ifdef CONFIG_SILKWORM_MLT_VMALLOC
+extern int console_mlt_vm;
+
+#define MLT_VM_CONSOLE_SIZE_BASIC       0x00000400UL  
+#define MLT_VM_CONSOLE_SIZE_DETAILED    0x00000800UL 
+#define MLT_VM_CONSOLE_CNT_BASIC        0x00002000UL
+#define MLT_VM_CONSOLE_CNT_DETAILED     0x00004000UL  
+#define MLT_VM_CONSOLE_STATS_BASIC      0x00010000UL 
+#define MLT_VM_CONSOLE_STATS_DETAILED   0x00040000UL
+
+#endif
 
 #define CONFIG_SILKWORM_SLUG	1	/* enable deferred free */
+
+#ifdef CONFIG_SILKWORM_MLT_KMALLOC_LARGE
+extern int mlt_kl_enabled;
+extern int console_mlt_kl;
+
+#define MLT_KL_CONSOLE_SIZE_BASIC       0x00000400UL  
+#define MLT_KL_CONSOLE_SIZE_DETAILED    0x00000800UL 
+#define MLT_KL_CONSOLE_CNT_BASIC        0x00002000UL
+#define MLT_KL_CONSOLE_CNT_DETAILED     0x00004000UL  
+#define MLT_KL_CONSOLE_STATS_BASIC      0x00010000UL 
+#define MLT_KL_CONSOLE_STATS_DETAILED   0x00040000UL
+
+#endif
+
+extern int no_oom_tmpdir, no_oom_mem, no_oom_task;
+
+#ifdef CONFIG_SILKWORM_MLT
+extern int mlt_km_enabled;
+extern int console_mlt;
+
+#define MLT_CONSOLE_SIZE_BASIC       0x00000400UL  
+#define MLT_CONSOLE_SIZE_DETAILED    0x00000800UL 
+#define MLT_CONSOLE_CNT_BASIC        0x00002000UL
+#define MLT_CONSOLE_CNT_DETAILED     0x00004000UL  
+#define MLT_CONSOLE_STATS_BASIC      0x00010000UL 
+#define MLT_CONSOLE_STATS_DETAILED   0x00040000UL
+
+#endif
 
 enum stat_item {
 	ALLOC_FASTPATH,		/* Allocation from cpu slab */
@@ -93,6 +136,10 @@ struct kmem_cache {
 	struct list_head list;	/* List of slab caches */
 #ifdef CONFIG_SLUB_DEBUG
 	struct kobject kobj;	/* For sysfs */
+#ifdef CONFIG_ESLUB_DEBUG
+	int xtrack;
+	atomic_long_t eslub_total_mem;
+#endif
 #endif
 
 
@@ -120,8 +167,11 @@ struct kmem_cache {
 };
 
 #ifdef CONFIG_SILKWORM_MLT
+extern int mlt_enabled;
+extern atomic_t kmalloc_large_cnt;
 struct kmem_cache *get_cachep (size_t size, gfp_t flags);
 static __always_inline MLT_book_keeping_info_t *get_mlt_offset(struct kmem_cache *s, void *object);
+static __always_inline void init_mlt_metadata(MLT_book_keeping_info_t *);
 #define obj_size_api(cachep) ((cachep)->objsize)
 #endif
 
@@ -264,6 +314,22 @@ static __always_inline void *kmalloc_large (size_t size, gfp_t flags)
 	unsigned int order = get_order (size);
 	void *ret = (void *) __get_free_pages (flags | __GFP_COMP, order);
 
+#ifdef CONFIG_SILKWORM_MLT_KMALLOC_LARGE
+	if (mlt_kl_enabled)
+	{
+	    MLT_KL_param_t mlt_kl_param;
+
+	    memset(&mlt_kl_param, 0, sizeof(MLT_KL_param_t));
+	    mlt_kl_param.alloc_ptr = ret;
+	    mlt_kl_param.alloc_size = PAGE_SIZE << order;
+	    MLT_KL_alloc_processing(&mlt_kl_param);
+	}
+#endif
+
+#ifdef CONFIG_SILKWORM_MLT
+	atomic_inc(&kmalloc_large_cnt);
+#endif
+
 	kmemleak_alloc (ret, size, 1, flags);
 	trace_kmalloc (_THIS_IP_, ret, size, PAGE_SIZE << order, flags);
 	kmemleak_alloc (ret, size, 1, flags);
@@ -298,7 +364,7 @@ kmalloc (size_t size, gfp_t flags)
 								      flags);
 			
 #ifdef CONFIG_SILKWORM_MLT
-				      if (ret) {
+				      if ((ret) && (!mlt_km_enabled)) {
                 				mlt_param.s = s;
                 				mlt_param.ptr = ret;
                 				MLT_kmalloc_processing(&mlt_param);
@@ -367,6 +433,16 @@ static __always_inline MLT_book_keeping_info_t *get_mlt_offset(struct kmem_cache
 	
 	return p;
 }
+
+static __always_inline void init_mlt_metadata(MLT_book_keeping_info_t *p)
+{
+        memset(p, 0, sizeof(MLT_book_keeping_info_t));
+        p->MLT_hash_node_ptr = ZERO_SIZE_PTR;
+        p->mlt_signature = MLT_PATH_SIGNATURE;
+
+        return;
+}
+
 #endif
 
 #endif /* _LINUX_SLUB_DEF_H */
