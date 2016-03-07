@@ -30,8 +30,12 @@
 #include <linux/fault-inject.h>
 #include <linux/kmemleak.h>
 #include <linux/kernel.h>
+
 #ifdef CONFIG_SILKWORM_SLUG
 #include <linux/module.h>
+#endif
+#ifdef CONFIG_SILKWORM_MLT_KMALLOC_LARGE
+#include <linux/mlt_kl_inc.h>
 #endif
 
 /*
@@ -205,6 +209,29 @@ static int slub_validate_off = 0;
 void kick_watchdog(void);
 #endif
 
+
+#ifdef CONFIG_SILKWORM_MLT
+#ifdef CONFIG_SILKWORM_MLT_DEFAULT_ENABLE
+int mlt_enabled = CONFIG_SILKWORM_MLT_DEFAULT_ENABLE;
+#else 
+int mlt_enabled = 1;
+#endif
+
+atomic_t kmalloc_large_cnt = ATOMIC_INIT(0);
+int mlt_km_enabled = 0;
+#endif 
+#ifdef CONFIG_SILKWORM_MLT_KMALLOC_LARGE
+int mlt_kl_enabled = 0;
+int console_mlt_kl=0;
+#endif
+
+#ifdef CONFIG_SILKWORM_MLT_VMALLOC
+int console_mlt_vm=0;
+#endif
+
+int console_mlt = 0, no_oom_tmpdir = 0, no_oom_mem = 0, no_oom_task = 0;
+
+
 static enum {
 	DOWN,		/* No slab functionality available */
 	PARTIAL,	/* kmem_cache_open() works but kmalloc does not */
@@ -229,10 +256,52 @@ struct track {
 enum track_item { TRACK_ALLOC, TRACK_FREE };
 
 #ifdef CONFIG_SLUB_DEBUG
+#ifdef CONFIG_ESLUB_DEBUG
+
+#define ESLUB_POISON 0xdeadbeef
+#define ESLUB_XTRACK_INTERNAL 0x00000100UL
+#define ESLUB_XTRACK_EXTERNAL 0x00000200UL
+/* stack entries should be multiple of 2 for alloc and free */
+#define ESLUB_MAX_STACK_ENTRY 6
+#define ESLUB_NUM_NEIGHS      3
+#define ESLUB_NUM_CTX         3
+
+extern void save_stack(void **stack, int depth);
+
+#if defined(CONFIG_ESLUB_DEBUG_ON) || defined(CONFIG_DEBUG_WATCHPOINT)
+static int eslub_debug_flags = ESLUB_XTRACK_INTERNAL;
+#else
+static int eslub_debug_flags = 0;
+#endif
+static int eslub_num_neighs = ESLUB_NUM_NEIGHS;
+static int eslub_num_ctx = ESLUB_NUM_CTX;
+static char *eslub_debug_slabs = NULL;
+static atomic_long_t eslub_total = ATOMIC_INIT(0);
+
+struct xtrack_item {
+	int redzone;
+	int type;
+	int cpu;
+	int pid;
+	unsigned long when;
+	void *stack[ESLUB_MAX_STACK_ENTRY];
+};
+
+struct xtrack {
+	int idx;
+	struct xtrack_item track[0];
+};
+
+
+#define XTRACK_SIZE (sizeof(struct xtrack) + eslub_num_ctx * sizeof(struct xtrack_item))
+static inline void set_xtrack(struct kmem_cache *s, void *object,
+			 enum track_item alloc, unsigned long addr);
+static inline void init_xtrack(struct kmem_cache *s, void *object);
+#endif
+
 static int sysfs_slab_add(struct kmem_cache *);
 static int sysfs_slab_alias(struct kmem_cache *, const char *);
 static void sysfs_slab_remove(struct kmem_cache *);
-
 #else
 static inline int sysfs_slab_add(struct kmem_cache *s) { return 0;}
 static inline int sysfs_slab_alias(struct kmem_cache *s, const char *p)
@@ -243,6 +312,8 @@ static inline void sysfs_slab_remove(struct kmem_cache *s)
 }
 
 #endif
+
+static struct page *get_object_page(const void *x);
 
 static inline void stat(struct kmem_cache *s, enum stat_item si)
 {
@@ -344,7 +415,7 @@ int kmem_cache_objects(struct kmem_cache *s)
 /*
  * Debug settings:
  */
-#ifdef CONFIG_SLUB_DEBUG_ON
+#if defined(CONFIG_SLUB_DEBUG_ON) || defined(CONFIG_DEBUG_WATCHPOINT)
 static int slub_debug = DEBUG_DEFAULT_FLAGS;
 #else
 static int slub_debug;
@@ -352,6 +423,12 @@ static int slub_debug;
 
 static char *slub_debug_slabs;
 static int disable_higher_order_debug;
+
+int slub_debug_enabled(void)
+{
+		return (slub_debug);
+}
+EXPORT_SYMBOL(slub_debug_enabled);
 
 /*
  * Object debugging
@@ -648,13 +725,31 @@ static void set_track(struct kmem_cache *s, void *object,
 		memset(p, 0, sizeof(struct track));
 }
 
+#ifdef CONFIG_ESLUB_DEBUG
+static int eslub_debug_enabled(struct kmem_cache *s)
+{
+	/* add custom funciton to reduce granularity
+	   || (!eslub_debug_slabs ||
+	  strncmp(eslub_debug_slabs, s->name, strlen(eslub_debug_slabs)))
+	*/
+	if (!eslub_debug_flags) 
+		return 0;
+	return 1;
+}
+#endif
+
 static void init_tracking(struct kmem_cache *s, void *object)
 {
-	if (!(s->flags & SLAB_STORE_USER))
-		return;
+	if (s->flags & SLAB_STORE_USER) {
+		set_track(s, object, TRACK_FREE, 0UL);
+		set_track(s, object, TRACK_ALLOC, 0UL);
+	}
 
-	set_track(s, object, TRACK_FREE, 0UL);
-	set_track(s, object, TRACK_ALLOC, 0UL);
+#ifdef CONFIG_ESLUB_DEBUG   
+	if (eslub_debug_enabled(s)) {
+		init_xtrack(s, object); 
+	}
+#endif   
 }
 
 static void print_track(const char *s, struct track *t)
@@ -674,6 +769,75 @@ static void print_tracking(struct kmem_cache *s, void *object)
 	print_track("Allocated", get_track(s, object, TRACK_ALLOC));
 	print_track("Freed", get_track(s, object, TRACK_FREE));
 }
+
+#ifdef CONFIG_ESLUB_DEBUG
+static void print_track_ex(struct kmem_cache *c, const u8 *obj)
+{
+	struct xtrack_item *it = NULL;
+	struct xtrack *t = NULL;
+	struct page *page = NULL;
+	int off = 0, i = 0, j = 0;
+	u8 *s = NULL;
+	
+	if (eslub_debug_flags & ESLUB_XTRACK_EXTERNAL) {
+		page = get_object_page(obj);
+		s = page_address(page);
+		off = (obj - s)/c->size;
+		s = page_address(page->trace_page);
+		s += off * XTRACK_SIZE;
+		t = (struct xtrack *)s;
+	} else {
+		t = (struct xtrack *)(obj + c->xtrack);
+	}
+
+	printk(KERN_ERR "INFO: Slab object=0x%p\n", obj);	
+
+	for (i = 0, off = t->idx - 1; i < eslub_num_ctx; i++, off--) {
+		if (off < 0)
+			off = eslub_num_ctx - 1;
+
+		it = (struct xtrack_item *)(t->track + off);
+		if (it->type == -1)
+			continue;
+		
+		printk (KERN_ERR "\t(%d)INFO: type = %s age=%luus cpu=%u pid=%d\n",
+		       i+1, it->type == TRACK_ALLOC ? "alloc" : "free",
+			(get_cycles() - it->when)/tb_ticks_per_usec, it->cpu, it->pid);
+		
+		for (j = 0; j < ESLUB_MAX_STACK_ENTRY; j++)
+			if (it->stack[j])
+				printk(KERN_ERR "\t\t[<%p> (%pS)]\n", it->stack[j], it->stack[j]);
+	}
+
+
+	printk(KERN_ERR "\n");
+} 
+
+static void print_neigh_tracking(struct kmem_cache *s, struct page *page, u8 *object)
+{
+	u8 *addr;
+	u8 *start, *end;
+	int n;
+
+	if (!eslub_debug_enabled(s))
+		return;
+
+	addr = page_address(page);
+	n = s->size * eslub_num_neighs;
+	start = object - n;
+	end = object + n;
+	if (object - n < addr)
+		start = addr;
+
+	if (object + n > addr + page->objects * s->size)
+		end = addr + page->objects * s->size;
+	
+	while (start < end) {
+		print_track_ex(s, start);
+		start += s->size;
+	}
+}
+#endif
 
 static void print_page_info(struct page *page)
 {
@@ -988,6 +1152,11 @@ static int check_pad_bytes(struct kmem_cache *s, struct page *page, u8 *p)
 	}
 #endif
 
+#ifdef CONFIG_ESLUB_DEBUG
+	if (eslub_debug_enabled(s) && (eslub_debug_flags & ESLUB_XTRACK_INTERNAL))
+		off += XTRACK_SIZE;
+#endif
+
 	if (s->flags & SLAB_STORE_USER)
 		/* We also have user information there */
 		off += 2 * sizeof(struct track);
@@ -1051,14 +1220,18 @@ static int check_object(struct kmem_cache *s, struct page *page,
 		active ? SLUB_RED_ACTIVE : SLUB_RED_INACTIVE;
 
 		if (!check_bytes_and_report(s, page, object, "Redzone",
-					    endobject, red, s->inuse - s->objsize))
+					    endobject, red, s->inuse - s->objsize)) {
 			return 0;
+		}
 	} else {
 		if ((s->flags & SLAB_POISON) && s->objsize < s->inuse) {
-			check_bytes_and_report(s, page, p, "Alignment padding",
-					       endobject, POISON_INUSE, s->inuse - s->objsize);
+			if (!check_bytes_and_report(s, page, p, "Alignment padding",
+					       endobject, POISON_INUSE, s->inuse - s->objsize)) {
+				return 0;
+			}
 		}
 	}
+
 
 	if (s->flags & SLAB_POISON) {
 		if (!active && (s->flags & __OBJECT_POISON) &&
@@ -1067,10 +1240,12 @@ static int check_object(struct kmem_cache *s, struct page *page,
 		     !check_bytes_and_report(s, page, p, "Poison",
 					     p + s->objsize - 1, POISON_END, 1)))
 			return 0;
+
 		/*
 		 * check_pad_bytes cleans up on its own.
 		 */
-		check_pad_bytes(s, page, p);
+		if (!check_pad_bytes(s, page, p))
+			return 0;
 	}
 
 	if (!s->offset && active)
@@ -1091,6 +1266,7 @@ static int check_object(struct kmem_cache *s, struct page *page,
 		set_freepointer(s, p, NULL);
 		return 0;
 	}
+
 	return 1;
 }
 
@@ -1312,6 +1488,12 @@ static inline void dec_slabs_node(struct kmem_cache *s, int node, int objects)
 static void setup_object_debug(struct kmem_cache *s, struct page *page,
 			       void *object)
 {
+#ifdef CONFIG_SILKWORM_MLT
+        MLT_book_keeping_info_t *mlt_metadata;
+
+        mlt_metadata = get_mlt_offset(s, object);
+        init_mlt_metadata(mlt_metadata);
+#endif
 	if (!(s->flags & (SLAB_STORE_USER|SLAB_RED_ZONE|__OBJECT_POISON)))
 		return;
 
@@ -1349,11 +1531,19 @@ static int alloc_debug_processing(struct kmem_cache *s, struct page *page,
 	/* Success perform special debug activities for allocs */
 	if (s->flags & SLAB_STORE_USER)
 		set_track(s, object, TRACK_ALLOC, addr);
+
+#ifdef CONFIG_ESLUB_DEBUG   
+	set_xtrack(s, object, TRACK_ALLOC, addr);
+#endif	
 	trace(s, page, object, 1);
 	init_object(s, object, 1);
 	return 1;
 
-	bad:
+ bad:
+#ifdef CONFIG_ESLUB_DEBUG   
+	print_neigh_tracking(s, page, object);
+#endif
+   
 	if (PageSlab(page)) {
 		/*
 		 * If this is a slab page then lets do the best we can
@@ -1377,10 +1567,11 @@ static int free_debug_processing(struct kmem_cache *s, struct page *page,
 		stk_ptr = get_slug_free(s, object);
 		set_slug_stack(stk_ptr, object);
 	}
-#endif	
+#endif
+	
 	if (!check_slab(s, page))
 		goto fail;
-
+	
 	if (!check_valid_pointer(s, page, object)) {
 		slab_err(s, page, "Invalid object pointer 0x%p", object);
 		goto fail;
@@ -1390,9 +1581,13 @@ static int free_debug_processing(struct kmem_cache *s, struct page *page,
 		object_err(s, page, object, "Object already free");
 		goto fail;
 	}
-
-	if (!check_object(s, page, object, 1))
+	
+	if (!check_object(s, page, object, 1)) {
+#ifdef CONFIG_ESLUB_DEBUG	   
+		print_neigh_tracking(s, page, object);
+#endif	   
 		return 0;
+	}
 
 	if (unlikely(s != page->slab)) {
 		if (!PageSlab(page)) {
@@ -1427,13 +1622,21 @@ static int free_debug_processing(struct kmem_cache *s, struct page *page,
 	/* Special debug activities for freeing objects */
 	if (!PageSlubFrozen(page) && !page->freelist)
 		remove_full(s, page);
+
 	if (s->flags & SLAB_STORE_USER)
 		set_track(s, object, TRACK_FREE, addr);
+
+#ifdef CONFIG_ESLUB_DEBUG
+   set_xtrack(s, object, TRACK_FREE, addr);
+#endif	
 	trace(s, page, object, 0);
 	init_object(s, object, 0);
 	return 1;
 
 	fail:
+#ifdef CONFIG_ESLUB_DEBUG   
+	print_neigh_tracking(s, page, object);
+#endif   
 	slab_fix(s, "Object at 0x%p not freed", object);
 	return 0;
 }
@@ -1456,7 +1659,11 @@ static struct kernel_symbol *lookup_symbol(const char *name,
 #endif
 static int __init setup_slub_debug(char *str)
 {
-	slub_debug = DEBUG_DEFAULT_FLAGS;
+	int def_flags = DEBUG_DEFAULT_FLAGS & ~SLAB_STORE_USER;
+	slub_debug = def_flags;
+#ifdef CONFIG_ESLUB_DEBUG   
+	eslub_debug_flags = ESLUB_XTRACK_INTERNAL;
+#endif	
 	if (*str++ != '=' || !*str)
 		/*
 		 * No options specified. Switch on full debugging.
@@ -1513,6 +1720,36 @@ static int __init setup_slub_debug(char *str)
 		case 'a':
 			slub_debug |= SLAB_FAILSLAB;
 			break;
+#ifdef CONFIG_ESLUB_DEBUG		   
+		case 'c':
+			str++;
+			if (*str >= '0' && *str <= '9')
+				eslub_num_ctx = *str - '0';
+			
+			/* make it even if not */
+			if (eslub_num_ctx & 0x1)
+				eslub_num_ctx++;
+
+			if(eslub_num_ctx == 0)
+				eslub_debug_flags = 0;
+			break;
+		case 'n':
+			str++;
+			if (*str >= '0' && *str <= '9')
+				eslub_num_neighs = *str - '0';
+			
+			if(eslub_num_neighs == 0)
+				eslub_debug_flags = 0;
+			break;
+		case 'i':
+			eslub_debug_flags = ESLUB_XTRACK_INTERNAL;
+			slub_debug |= def_flags;
+			break;
+		case 'o':
+			eslub_debug_flags = ESLUB_XTRACK_EXTERNAL;
+			slub_debug |= def_flags;
+			break;
+#endif			
 		default:
 			printk(KERN_ERR "slub_debug option '%c' "
 			       "unknown. skipped\n", *str);
@@ -1527,6 +1764,8 @@ static int __init setup_slub_debug(char *str)
 }
 
 __setup("slub_debug", setup_slub_debug);
+
+
 
 static unsigned long kmem_cache_flags(unsigned long objsize,
 				      unsigned long flags, const char *name,
@@ -1643,6 +1882,7 @@ static struct page *allocate_slab(struct kmem_cache *s, gfp_t flags, int node)
 	}
 
 	page->objects = oo_objects(oo);
+	page->trace_page = NULL;
 	mod_zone_page_state(page_zone(page),
 			    (s->flags & SLAB_RECLAIM_ACCOUNT) ?
 			    NR_SLAB_RECLAIMABLE : NR_SLAB_UNRECLAIMABLE,
@@ -1688,11 +1928,18 @@ static struct page *new_slab(struct kmem_cache *s, gfp_t flags, int node)
 			SLAB_STORE_USER | SLAB_TRACE))
 		__SetPageSlubDebug(page);
 
+#ifdef CONFIG_ESLUB_DEBUG   
+	if (eslub_debug_enabled(s) && (eslub_debug_flags & ESLUB_XTRACK_INTERNAL)) {
+		atomic_add(page->objects * XTRACK_SIZE, &s->eslub_total_mem);
+		atomic_add(page->objects * XTRACK_SIZE, &eslub_total);
+	}
+#endif   
 	start = page_address(page);
 
 	if (unlikely(s->flags & SLAB_POISON))
 		memset(start, POISON_INUSE, PAGE_SIZE << compound_order(page));
 
+	
 	last = start;
 	for_each_object(p, s, start, page->objects) {
 		setup_object(s, page, last);
@@ -1728,7 +1975,7 @@ static void __free_slab(struct kmem_cache *s, struct page *page)
 {
 	int order = compound_order(page);
 	int pages = 1 << order;
-
+	
 #ifdef CONFIG_SILKWORM_SLUG
 	if (s->flags & SLAB_DFREE)
 	{
@@ -1763,6 +2010,16 @@ static void __free_slab(struct kmem_cache *s, struct page *page)
 	}
 
 	kmemcheck_free_shadow(page, compound_order(page));
+#ifdef CONFIG_ESLUB_DEBUG   
+	if (eslub_debug_enabled(s) && (eslub_debug_flags & ESLUB_XTRACK_EXTERNAL) && page->trace_page) {
+	   int trace_order;	   
+		trace_order = compound_order(page->trace_page);
+		__free_pages(page->trace_page, trace_order);
+		atomic_sub(1<<trace_order, &s->eslub_total_mem);
+		atomic_sub(1<<trace_order, &eslub_total);
+		page->trace_page = NULL;
+	}
+#endif
 
 	mod_zone_page_state(page_zone(page),
 			    (s->flags & SLAB_RECLAIM_ACCOUNT) ?
@@ -1773,6 +2030,7 @@ static void __free_slab(struct kmem_cache *s, struct page *page)
 	reset_page_mapcount(page);
 	if (current->reclaim_state)
 		current->reclaim_state->reclaimed_slab += pages;
+
 	__free_pages(page, order);
 }
 
@@ -1800,6 +2058,12 @@ static void free_slab(struct kmem_cache *s, struct page *page)
 static void discard_slab(struct kmem_cache *s, struct page *page)
 {
 	dec_slabs_node(s, page_to_nid(page), page->objects);
+#ifdef CONFIG_ESLUB_DEBUG	   
+	if (eslub_debug_enabled(s) && (eslub_debug_flags & ESLUB_XTRACK_INTERNAL)) {
+		atomic_sub(page->objects * XTRACK_SIZE, &s->eslub_total_mem);
+		atomic_sub(page->objects * XTRACK_SIZE, &eslub_total);
+	}
+#endif   
 	free_slab(s, page);
 }
 
@@ -2392,9 +2656,37 @@ void *kmem_cache_alloc(struct kmem_cache *s, gfp_t gfpflags)
 
 	trace_kmem_cache_alloc(_RET_IP_, ret, s->objsize, s->size, gfpflags);
 
+#ifdef CONFIG_SILKWORM_MLT
+        if ((ret) && (mlt_km_enabled)) {
+                MLT_param_t mlt_param;
+                mlt_param.s = s;
+
+#ifdef CONFIG_SILKWORM_SLUG
+                if (ret && (s->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+                        mlt_param.ptr = (void *)((unsigned long)ret - cache_line_size());
+                else
+#endif
+                        mlt_param.ptr = ret;
+
+                MLT_kmalloc_processing(&mlt_param);
+        }
+#endif
+
 	return ret;
 }
 EXPORT_SYMBOL(kmem_cache_alloc);
+
+#ifdef CONFIG_SILKWORM_MLT
+void *kmem_cache_alloc_mlt_bypass(struct kmem_cache *s, gfp_t gfpflags)
+{
+        void *ret = slab_alloc(s, gfpflags, -1, _RET_IP_);
+
+        trace_kmem_cache_alloc(_RET_IP_, ret, s->objsize, s->size, gfpflags);
+
+        return ret;
+}
+EXPORT_SYMBOL(kmem_cache_alloc_mlt_bypass);
+#endif
 
 #ifdef CONFIG_SILKWORM_SLUG
 void *kmem_cache_alloc_brcd(struct kmem_cache *s, gfp_t gfpflags)
@@ -2437,6 +2729,22 @@ void *kmem_cache_alloc_node(struct kmem_cache *s, gfp_t gfpflags, int node)
 
 	trace_kmem_cache_alloc_node(_RET_IP_, ret,
 				    s->objsize, s->size, gfpflags, node);
+
+#ifdef CONFIG_SILKWORM_MLT
+        if ((ret) && (mlt_km_enabled)) {
+                MLT_param_t mlt_param;
+                mlt_param.s = s;
+
+#ifdef CONFIG_SILKWORM_SLUG
+                if (ret && (s->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+                        mlt_param.ptr = (void *)((unsigned long)ret - cache_line_size());
+                else
+#endif
+                        mlt_param.ptr = ret;
+
+                MLT_kmalloc_processing(&mlt_param);
+        }
+#endif
 
 	return ret;
 }
@@ -2623,11 +2931,40 @@ void kmem_cache_free(struct kmem_cache *s, void *x)
 
 	page = virt_to_head_page(x);
 
+#ifdef CONFIG_SILKWORM_MLT
+	if (mlt_km_enabled)
+	{
+        	MLT_param_t mlt_param;
+        	mlt_param.s = page->slab;
+#ifdef CONFIG_SILKWORM_SLUG
+        	if (x && (page->slab->flags & SLAB_DFREE) && (slub_debug & SLAB_POISON))
+                	mlt_param.ptr = (void *)((unsigned long)x - cache_line_size());
+        	else
+#endif
+        	mlt_param.ptr = x;
+        	MLT_kfree_processing(&mlt_param);
+	}
+#endif
+
 	slab_free(s, page, x, _RET_IP_);
 
 	trace_kmem_cache_free(_RET_IP_, x);
 }
 EXPORT_SYMBOL(kmem_cache_free);
+
+#ifdef CONFIG_SILKWORM_MLT
+void kmem_cache_free_mlt_bypass(struct kmem_cache *s, void *x)
+{
+        struct page *page;
+
+        page = virt_to_head_page(x);
+
+        slab_free(s, page, x, _RET_IP_);
+
+        trace_kmem_cache_free(_RET_IP_, x);
+}
+EXPORT_SYMBOL(kmem_cache_free_mlt_bypass);
+#endif
 
 /* Figure out on which slab page the object resides */
 static struct page *get_object_page(const void *x)
@@ -3040,6 +3377,12 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 		 */
 		size += 2 * sizeof(struct track);
 
+#ifdef CONFIG_ESLUB_DEBUG	   
+	if (eslub_debug_enabled(s) && (eslub_debug_flags & ESLUB_XTRACK_INTERNAL)) {
+		s->xtrack = size;
+		size += XTRACK_SIZE;
+	}
+#endif	
 	if (flags & SLAB_RED_ZONE)
 		/*
 		 * Add some empty padding so that we can catch
@@ -3111,7 +3454,10 @@ static int kmem_cache_open(struct kmem_cache *s, gfp_t gfpflags,
 	s->objsize = size;
 	s->align = align;
 	s->flags = kmem_cache_flags(size, flags, name, ctor);
-
+#ifdef CONFIG_ESLUB_DEBUG	   
+	atomic_long_set(&s->eslub_total_mem, 0);
+#endif
+   
 #ifdef CONFIG_SILKWORM_SLUG
 	/* 
 	 * We want to add a header in front of the object to catch if 
@@ -3462,6 +3808,10 @@ static noinline struct kmem_cache *dma_kmalloc_cache(int index, gfp_t flags)
 	if (slab_state >= SYSFS)
 		slabflags |= __SYSFS_ADD_DEFERRED;
 
+#ifdef CONFIG_SILKWORM
+	slabflags |= SLAB_HWCACHE_ALIGN;
+#endif
+
 	if (!text || !kmem_cache_open(s, flags, text,
 				      realsize, ARCH_KMALLOC_MINALIGN, slabflags, NULL)) {
 		s->size = 0;
@@ -3657,6 +4007,22 @@ static void *kmalloc_large_node(size_t size, gfp_t flags, int node)
 	if (page)
 		ptr = page_address(page);
 
+#ifdef CONFIG_SILKWORM_MLT_KMALLOC_LARGE
+        if ((ptr) && (mlt_kl_enabled))
+        {
+            MLT_KL_param_t mlt_kl_param;
+
+            memset(&mlt_kl_param, 0, sizeof(MLT_KL_param_t));
+            mlt_kl_param.alloc_ptr = ptr;
+            mlt_kl_param.alloc_size = PAGE_SIZE << get_order(size);
+            MLT_KL_alloc_processing(&mlt_kl_param);
+        }
+#endif
+
+#ifdef CONFIG_SILKWORM_MLT
+        atomic_inc(&kmalloc_large_cnt);
+#endif
+
 	kmemleak_alloc(ptr, size, 1, flags);
 	return ptr;
 
@@ -3750,6 +4116,9 @@ void kfree(const void *x)
 #ifdef CONFIG_SILKWORM_MLT
         MLT_param_t mlt_param;
 #endif
+#ifdef CONFIG_SILKWORM_MLT_KMALLOC_LARGE
+        MLT_KL_param_t mlt_kl_param;
+#endif
 
 	trace_kfree(_RET_IP_, x);
 
@@ -3759,6 +4128,19 @@ void kfree(const void *x)
 	page = virt_to_head_page(x);
 	if (unlikely(!PageSlab(page))) {
 		BUG_ON(!PageCompound(page));
+#ifdef CONFIG_SILKWORM_MLT_KMALLOC_LARGE
+		if (mlt_kl_enabled)
+		{
+		    memset(&mlt_kl_param, 0, sizeof(MLT_KL_param_t));
+        	    mlt_kl_param.alloc_ptr = x;
+		    MLT_KL_free_processing(&mlt_kl_param);
+		}
+#endif
+
+#ifdef CONFIG_SILKWORM_MLT
+		atomic_dec(&kmalloc_large_cnt);
+#endif
+
 		kmemleak_free(x);
 		put_page(page);
 		return;
@@ -3777,6 +4159,186 @@ void kfree(const void *x)
 	slab_free(page->slab, page, object, _RET_IP_);
 }
 EXPORT_SYMBOL(kfree);
+
+#ifdef CONFIG_SILKWORM_MLT
+void setup_mlt(char *str)
+{
+	if (*str++ != '=' || !*str)
+		/*
+		 * No options specified. Switch on full debugging.
+		 */
+		return;
+
+	for (; *str && *str != ','; str++) {
+		switch (tolower(*str)) {
+		case '0':
+			mlt_enabled = 0;
+			break;
+		case '1':
+			mlt_enabled = 1;
+			break;
+		default:
+			printk(KERN_ERR "mlt option '%c' "
+			       "unknown. skipped\n", *str);
+		}
+	}
+
+}
+EXPORT_SYMBOL(mlt_enabled);
+
+__setup("mlt", setup_mlt);
+
+void setup_mlt_km(void)
+{
+	mlt_km_enabled = 1;
+}
+EXPORT_SYMBOL(mlt_km_enabled);
+
+__setup("mlt_km", setup_mlt_km);
+
+EXPORT_SYMBOL(kmalloc_large_cnt);
+#endif
+
+
+#ifdef CONFIG_SILKWORM_MLT_KMALLOC_LARGE
+void setup_mlt_kl(void)
+{
+	mlt_kl_enabled = 1;
+}
+EXPORT_SYMBOL(mlt_kl_enabled);
+
+__setup("mlt_kl", setup_mlt_kl);
+#endif
+
+
+#ifdef CONFIG_SILKWORM_MLT
+void setup_console_mlt(char *str)
+{
+	console_mlt = (MLT_CONSOLE_SIZE_BASIC | MLT_CONSOLE_CNT_BASIC | MLT_CONSOLE_STATS_BASIC);
+
+	if (*str++ != '=' || !*str)
+		/*
+		 * No options specified. Switch on full debugging.
+		 */
+		return;
+
+	for (; *str && *str != ','; str++) {
+		switch (tolower(*str)) {
+		case 's':
+			console_mlt |= MLT_CONSOLE_SIZE_DETAILED;
+			break;
+		case 't':
+			console_mlt |= MLT_CONSOLE_CNT_DETAILED;
+			break;
+		case 'e':
+			console_mlt |= MLT_CONSOLE_STATS_DETAILED;
+			break;
+		default:
+			printk(KERN_ERR "console_mlt option '%c' "
+			       "unknown. skipped\n", *str);
+		}
+	}
+
+	return;
+}
+EXPORT_SYMBOL(console_mlt);
+
+__setup("console_mlt", setup_console_mlt);
+#endif
+
+#ifdef CONFIG_SILKWORM_MLT_KMALLOC_LARGE
+void setup_console_mlt_kl(char *str)
+{
+	console_mlt_kl = (MLT_KL_CONSOLE_SIZE_BASIC | MLT_KL_CONSOLE_CNT_BASIC |  
+				MLT_KL_CONSOLE_STATS_BASIC);
+
+	if (*str++ != '=' || !*str)
+		/*
+		 * No options specified. Switch on full debugging.
+		 */
+		return;
+
+	for (; *str && *str != ','; str++) {
+		switch (tolower(*str)) {
+		case 's':
+			console_mlt_kl |= MLT_KL_CONSOLE_SIZE_DETAILED;
+			break;
+		case 't':
+			console_mlt_kl |= MLT_KL_CONSOLE_CNT_DETAILED;
+			break;
+		case 'e':
+			console_mlt_kl |= MLT_KL_CONSOLE_STATS_DETAILED;
+			break;
+		default:
+			printk(KERN_ERR "console_mlt_kl option '%c' "
+			       "unknown. skipped\n", *str);
+		}
+	}
+
+}
+EXPORT_SYMBOL(console_mlt_kl);
+
+__setup("console_mlt_kl", setup_console_mlt_kl);
+#endif
+
+#ifdef CONFIG_SILKWORM_MLT_VMALLOC
+void setup_console_mlt_vm(char *str)
+{
+	console_mlt_vm = (MLT_VM_CONSOLE_SIZE_BASIC | MLT_VM_CONSOLE_CNT_BASIC |  
+				MLT_VM_CONSOLE_STATS_BASIC);
+
+	if (*str++ != '=' || !*str)
+		/*
+		 * No options specified. Switch on full debugging.
+		 */
+		return;
+
+	for (; *str && *str != ','; str++) {
+		switch (tolower(*str)) {
+		case 's':
+			console_mlt_vm |= MLT_VM_CONSOLE_SIZE_DETAILED;
+			break;
+		case 't':
+			console_mlt_vm |= MLT_VM_CONSOLE_CNT_DETAILED;
+			break;
+		case 'e':
+			console_mlt_vm |= MLT_VM_CONSOLE_STATS_DETAILED;
+			break;
+		default:
+			printk(KERN_ERR "console_mlt_vm option '%c' "
+			       "unknown. skipped\n", *str);
+		}
+	}
+
+}
+EXPORT_SYMBOL(console_mlt_vm);
+
+__setup("console_mlt_vm", setup_console_mlt_vm);
+#endif
+
+void setup_oom_tmpdir(void)
+{
+        no_oom_tmpdir = 1;
+}
+EXPORT_SYMBOL(no_oom_tmpdir);
+
+__setup("no_oom_tmpdir", setup_oom_tmpdir);
+
+void setup_oom_mem(void)
+{
+        no_oom_mem = 1;
+}
+EXPORT_SYMBOL(no_oom_mem);
+
+__setup("no_oom_mem", setup_oom_mem);
+
+void setup_oom_task(void)
+{
+        no_oom_task = 1;
+}
+EXPORT_SYMBOL(no_oom_task);
+
+__setup("no_oom_task", setup_oom_task);
 
 /*
  * kmem_cache_shrink removes empty slabs from the partial lists and sorts
@@ -3998,6 +4560,107 @@ static int slab_memory_callback(struct notifier_block *self,
 
 #endif /* CONFIG_MEMORY_HOTPLUG */
 
+#ifdef CONFIG_ESLUB_DEBUG
+static inline void init_xtrack(struct kmem_cache *s, void *object)
+{
+	struct xtrack *p = object + s->xtrack;
+	int i;
+   
+	if (eslub_debug_enabled(s) && (eslub_debug_flags & ESLUB_XTRACK_INTERNAL)) {
+		p->idx = 0;
+		for (i = 0; i < eslub_num_ctx; i++) {
+			memset(&p->track[i], 0, sizeof(struct xtrack_item));
+			p->track[i].type = -1;
+			p->track[i].redzone = ESLUB_POISON;
+		}
+	}
+}
+			      
+static inline void store_xtrack(struct kmem_cache *s, struct xtrack *p, enum track_item alloc)
+{
+	if (p->track[p->idx].redzone != ESLUB_POISON) {
+		slab_bug(s, "xtrack redzone for cache=%s idx=%x byte=%x overwritten",
+			 s->name, p->idx, p->track[p->idx].redzone);
+		dump_stack();
+		return;
+	}
+
+	p->track[p->idx].type = alloc;
+	p->track[p->idx].cpu = smp_processor_id();
+	p->track[p->idx].pid = current->pid;
+	p->track[p->idx].when = get_cycles();
+	
+	memset(&p->track[p->idx].stack, 0, sizeof(void *) * ESLUB_MAX_STACK_ENTRY);
+	save_stack(p->track[p->idx].stack, ESLUB_MAX_STACK_ENTRY);
+	
+	p->idx++;
+	if (p->idx == eslub_num_ctx)
+		p->idx = 0;
+}
+
+static inline void set_xtrack_out(struct kmem_cache *s, void *object,
+		      enum track_item alloc, unsigned long addr)
+{
+	struct page *page;
+	int off;
+	struct xtrack *p;
+	int order;
+	void *t;
+	gfp_t flags = 0;
+
+
+	page = get_object_page(object);
+	if (!page->trace_page) {
+		order = get_order(page->objects * XTRACK_SIZE);
+		atomic_add(1<<order, &s->eslub_total_mem);
+		atomic_add(1<<order, &eslub_total);
+		flags = s->allocflags;
+		flags |= (__GFP_NOWARN | __GFP_NORETRY) & ~__GFP_NOFAIL;
+
+		/* printk(KERN_ERR "--- cache %s order=%d objects=%d eslub=%d flag=%x\n",
+		  s->name, order, page->objects, atomic_read(&s->eslub_total_mem), s->allocflags); */
+		
+		if (flags & __GFP_WAIT)
+			local_irq_enable();
+
+		page->trace_page = alloc_pages(flags | __GFP_ZERO, order);
+		
+		if (flags & __GFP_WAIT)
+			local_irq_disable();
+		
+		if (page->trace_page == NULL)
+			return;
+	}
+
+	off = (object - page_address(page))/s->size;
+	t = page_address(page->trace_page);
+	p = t + (off * XTRACK_SIZE);
+	store_xtrack(s, p, alloc);
+}
+
+static inline void set_xtrack_in(struct kmem_cache *s, void *object,
+			  enum track_item alloc, unsigned long addr)
+{
+	struct xtrack *p;
+	p = object + s->xtrack;
+	store_xtrack(s, p, alloc);
+}
+	
+
+static inline void set_xtrack(struct kmem_cache *s, void *object,
+		      enum track_item alloc, unsigned long addr)
+{
+	if (!eslub_debug_enabled(s))
+		return;
+
+	if (eslub_debug_flags & ESLUB_XTRACK_INTERNAL)
+		set_xtrack_in(s, object, alloc, addr);
+	else
+		set_xtrack_out(s, object, alloc, addr);
+}
+#endif
+
+
 /********************************************************************
  *			Basic setup of slabs
  *******************************************************************/
@@ -4081,13 +4744,11 @@ void __init kmem_cache_init(void)
 				     "kmalloc-192", 192, GFP_NOWAIT);
 		caches++;
 	}
-
 	for (i = KMALLOC_SHIFT_LOW; i < SLUB_PAGE_SHIFT; i++) {
 		create_kmalloc_cache(&kmalloc_caches[i],
 				     "kmalloc", 1 << i, GFP_NOWAIT);
 		caches++;
 	}
-
 #ifdef CONFIG_SILKWORM_SLUG
 #ifndef CONFIG_DFREE_ON
 	if (slub_debug & SLAB_POISON)
@@ -4097,6 +4758,7 @@ void __init kmem_cache_init(void)
 			create_kmalloc_cache(&kmalloc_brcd_caches[1],
 					     "kmalloc_brcd-96", 96, GFP_NOWAIT);
 		}
+
 		if (KMALLOC_MIN_SIZE <= 64) {
 			create_kmalloc_cache(&kmalloc_brcd_caches[2],
 					     "kmalloc_brcd-192", 192, GFP_NOWAIT);
@@ -4194,7 +4856,14 @@ void __init kmem_cache_init(void)
 	       slub_debug, caches, cache_line_size(),
 	       slub_min_order, slub_max_order, slub_min_objects,
 	       nr_cpu_ids, nr_node_ids);
-
+   
+#ifdef CONFIG_ESLUB_DEBUG
+	if(eslub_debug_flags)
+		printk(KERN_ERR "ESLUB debug enabled flags=%x ctx=%d neigh=%d slab=%s\n",
+		       eslub_debug_flags, eslub_num_ctx, eslub_num_neighs,
+		       eslub_debug_slabs ? eslub_debug_slabs : "none");
+#endif   
+	
 #ifdef CONFIG_SILKWORM_SLUG
 #ifndef CONFIG_DFREE_ON
 	if (slub_debug & SLAB_POISON)
@@ -5163,6 +5832,58 @@ static ssize_t dfree_min_store(struct kmem_cache *s, const char *buf,
 }
 SLAB_ATTR(dfree_min);
 
+#ifdef CONFIG_ESLUB_DEBUG   
+static ssize_t eslub_total_mem_show(struct kmem_cache *s, char *buf)
+{
+    return sprintf(buf, "%lu %lu\n", atomic_long_read(&s->eslub_total_mem), atomic_long_read(&eslub_total));
+}
+SLAB_ATTR_RO(eslub_total_mem);
+    
+static ssize_t eslub_neighs_show(struct kmem_cache *s, char *buf)
+{
+    return sprintf(buf, "%d\n", eslub_num_neighs);
+}
+    
+static ssize_t eslub_neighs_store(struct kmem_cache *s, const char *buf,
+				      size_t length)
+{
+    unsigned long val;
+    int err;
+    
+    err = strict_strtoul(buf, 10, &val);
+    if (err)
+	return err;
+    
+    eslub_num_neighs = val;
+    return length;
+}
+SLAB_ATTR(eslub_neighs);
+    
+static ssize_t eslub_contexts_show(struct kmem_cache *s, char *buf)
+{
+    return sprintf(buf, "%d\n", eslub_num_ctx);
+}
+    
+static ssize_t eslub_contexts_store(struct kmem_cache *s, const char *buf,
+				 size_t length)
+{
+    unsigned long val;
+    int err;
+    
+    err = strict_strtoul(buf, 10, &val);
+    if (err)
+	return err;
+    
+    eslub_num_ctx = val;
+    calculate_sizes(s, -1);
+    return length;
+}
+    
+
+SLAB_ATTR(eslub_contexts);
+    
+#endif
+
 static ssize_t max_objects_show(struct kmem_cache *s, char *buf)
 {
 	return sprintf(buf, "%lu\n", s->max_objects);
@@ -5583,6 +6304,11 @@ static struct attribute *slab_attrs[] = {
 	&objects_partial_attr.attr,
 	&total_objects_attr.attr,
 	&slabs_attr.attr,
+#ifdef CONFIG_ESLUB_DEBUG   
+	&eslub_total_mem_attr.attr,
+    	&eslub_neighs_attr.attr,
+    	&eslub_contexts_attr.attr,
+#endif   
 	&partial_attr.attr,
 	&cpu_slabs_attr.attr,
 	&ctor_attr.attr,
