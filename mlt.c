@@ -24,6 +24,9 @@
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/poison.h>
+#include <linux/vmalloc.h>
+#include <linux/lockdep.h>
+#include <linux/kallsyms.h>
 
 //#define PRINT printk(KERN_DEBUG"%s %d \r\n", __FUNCTION__, __LINE__)
 #define PRINT
@@ -31,6 +34,10 @@
 int 
 MLT_init(void);
 int MLT_dump_traces(void);
+
+#ifdef CONFIG_SILKWORM_MLT_KMALLOC_LARGE
+extern int mlt_kl_enabled;
+#endif
 
 /* Global variable definitions */
 int MLT_initialized = 0;	/* No lock is used to protect this variable as the impact of not using it hazardous */
@@ -46,10 +53,24 @@ static int kmalloc_cnt_sort = 0, kmalloc_size_sort=1, stk_top_skip_cnt = 0, log_
     list_stats_in_detail = 0, max_detail_stats = 10, rollover_stats_arr = 0, 
     clear_stats_now = 0, detail_entry_index = 0, bypass_mlt=0, display_cnt=20;
 static int cur_display_node_cnt = 0;
+
+static rwlock_t mlt_hash_tbl_lock[MLT_MAX_HASH];
+
+#define MLT_READ_LOCK(index) read_lock_irqsave(&mlt_hash_tbl_lock[index], flags)
+#define MLT_READ_UNLOCK(index) read_unlock_irqrestore(&mlt_hash_tbl_lock[index], flags)
+#define MLT_WRITE_LOCK(index) write_lock_irqsave(&mlt_hash_tbl_lock[index], flags)
+#define MLT_WRITE_UNLOCK(index) write_unlock_irqrestore(&mlt_hash_tbl_lock[index], flags)
+
+static atomic_t outstanding_alloc_cnt, outstanding_alloc_size;
 /* If MLT_conf_buff is modified, modify even the script at 
  * /vobs/projects/springboard/fabos/src/utils/sys/mlt
  */
+#ifdef MLT_DEBUG
+static int kmalloc_large_allocs=0;
+static char MLT_conf_buff[100] = "0 0 0 0 10 0 0 0 1 20 0";
+#else
 static char MLT_conf_buff[100] = "0 0 0 0 10 0 0 0 1 20";
+#endif
 static char MLT_conf_buff_format[] = "Format: \n"
     "    Number of kmalloc-cnt sorted entries to be displayed. < 100 expected\n"
     "    Number of top functions in stack trace to be skipped before storing in hash node \n"
@@ -60,7 +81,11 @@ static char MLT_conf_buff_format[] = "Format: \n"
     "    whether to clear the stats information now \n"
     "    Bypass MLT from now (Use it cautiously)\n"
     "    Number of total-allocation-size sorted entries to be displayed. < 100 expected\n"
-    "    MLT output display entries (should be < 100)\n";
+    "    MLT output display entries (should be < 100)\n"
+#ifdef MLT_DEBUG
+    "    Number of kmallocs to be done to cause OOM \n"
+#endif
+    ;
 
 #define MLT_PROCESS_ERROR(errCode) { \
 	atomic_inc(&MLT_stats[errCode]); \
@@ -185,15 +210,23 @@ static __always_inline unsigned int MLT_hash(unsigned long *stk_trace,
 			     unsigned int stk_trace_len,
 			     unsigned int *stk_fn_hash);
 static void insert_sort(MLT_hash_node_t *hash_node) ;
-static __always_inline int get_first_digit(int num);
 
-static int MLT_isdigit(char c);
 int MLT_get_panicdump_info(void *pdHandle, unsigned int event, void *cbArg,
 			   char **buff, int *len);
 static char *MLT_PD_buff;
+static char MLT_PD_tmp_buff[] = "MLT not enabled \r\n";
+static char MLT_PD_tmp_buff1[] = "MLT not initialized\r\n";
 static int MLT_PD_buff_len = 0;
 
 EXPORT_SYMBOL(MLT_initialized);
+
+#ifdef CONFIG_LOCKDEP
+typedef struct mlt_lock_class {
+        struct lock_class_key key;
+} mlt_lock_class_t;
+
+static mlt_lock_class_t lock_class;
+#endif
 
 /**************************************************************************************************************************/
 /**************************************************************************************************************************/
@@ -209,6 +242,20 @@ int MLT_init()
 #ifdef CONFIG_SILKWORM_MLT_DEBUG
 	struct proc_dir_entry *MLT_debug_config, *MLT_debug_data;
 #endif
+#ifdef CONFIG_LOCKDEP
+	char name[20]="mlt";
+#endif
+
+	if (!mlt_enabled)
+		return -1;
+
+        /* Initialize the MLT Locks */
+        for (i = 0; i < MLT_MAX_HASH; i++) {
+                mlt_hash_tbl_lock[i] = RW_LOCK_UNLOCKED;
+#ifdef CONFIG_LOCKDEP
+		lockdep_init_map(&mlt_hash_tbl_lock[i].dep_map, name, &(lock_class.key), 0);
+#endif
+        }
 
 	/* create MLT hash table */
 	MLT_hash_table = kzalloc(sizeof(MLT_hash_node_t) * MLT_MAX_HASH, 0);
@@ -290,8 +337,11 @@ int MLT_init()
 	/* Initialize the MLT_hash_table */
 	for (i = 0; i < MLT_MAX_HASH; i++) {
 		INIT_LIST_HEAD(&MLT_hash_table[i].MLT_hash_list_next);
-		INIT_LIST_HEAD(&MLT_hash_table[i].scheduled_for_deletion);
+		atomic_set(&MLT_hash_table[i].kmalloc_cnt, 1);
 	}
+
+	atomic_set(&outstanding_alloc_size, 0);
+	atomic_set(&outstanding_alloc_cnt, 0);
 
 	/* Initialize the Wrap Stack functions */
 	MLT_add_mem_wrp_func("__kmalloc");
@@ -299,18 +349,20 @@ int MLT_init()
 	MLT_add_mem_wrp_func("kmalloc_wrapper_dbg");
 	MLT_add_mem_wrp_func("vmalloc_wrapper_dbg");
 	MLT_add_mem_wrp_func("kstrdup");
+	MLT_add_mem_wrp_func("kmemdup");
 	MLT_add_mem_wrp_func("__alloc_skb");
 	MLT_add_mem_wrp_func("kmalloc_wrapper_nodbg");
 	MLT_add_mem_wrp_func("__proc_create");
+	MLT_add_mem_wrp_func("kmem_cache_alloc");
+	MLT_add_mem_wrp_func("kmem_cache_alloc_brcd");
+	MLT_add_mem_wrp_func("kmem_cache_alloc_node");
 	//MLT_add_mem_wrp_func("trace_define_field");
 	//MLT_add_mem_wrp_func("event_create_dir");
 	//MLT_add_mem_wrp_func("sysfs_new_dirent");
 
 	printk(KERN_WARNING "Initialized MLT\n");
 	MLT_initialized = 1;
-#if 1
 	kthread_run(mlt_garbage_collector, NULL, "MLT garbage collector\n");
-#endif
 	return MEMINFRA_INIT_SUCCESS;
 
       bailout7:
@@ -347,11 +399,14 @@ void MLT_kmalloc_processing(MLT_param_t *mlt_param)
 {
 	unsigned long mlt_stk_trace[MAX_MLT_STK_DEPTH];
 	unsigned int stk_trace_len, stk_fn_hash;
-	MLT_hash_node_t *MLT_hash_node_ptr;
-	MLT_hash_node_t *tail;
+	MLT_hash_node_t *MLT_hash_node_ptr=NULL, *resuable_MLT_hash_node_ptr=NULL;;
 	int found = 0;
 	unsigned int copy_count;
 	MLT_book_keeping_info_t *metadata;
+	unsigned long flags;
+
+	if (unlikely(!mlt_enabled))
+		return;
 
 	if (unlikely(bypass_mlt))
 		return;
@@ -383,32 +438,61 @@ void MLT_kmalloc_processing(MLT_param_t *mlt_param)
 		     &stk_fn_hash);
 	metadata->hash_index_compl = metadata->hash_index ^ 0xFFFF;
 
-	/* IR: iterate the table */
+	/* iterate the table */
+	MLT_READ_LOCK(metadata->hash_index);
 	MLT_hash_node_ptr = &MLT_hash_table[metadata->hash_index];
-	tail = &MLT_hash_table[metadata->hash_index];
 	list_for_each_entry(MLT_hash_node_ptr,
 			    &MLT_hash_table[metadata->hash_index].MLT_hash_list_next,
 			    MLT_hash_list_next) {
-		tail = MLT_hash_node_ptr;	/* save tail, so as not to use prev pointer later */
 		if ((MLT_hash_node_ptr->stk_trace_len == copy_count)
 		    && (MLT_hash_node_ptr->stk_fn_hash == stk_fn_hash)) {
 			metadata->MLT_hash_node_ptr = (void *)MLT_hash_node_ptr;
 			atomic_inc(& MLT_hash_node_ptr->kmalloc_cnt);
-			MLT_hash_node_ptr->hash_control.delete_wait_count = 0;
 			atomic_add(obj_size_api(mlt_param->s), &MLT_hash_node_ptr->total_alloc_size);
+
+			atomic_inc(&outstanding_alloc_cnt);
+			atomic_add(obj_size_api(mlt_param->s), &outstanding_alloc_size);
 			found = 1;
 			break;
-		}
-	}
+		} else if (atomic_read(&MLT_hash_node_ptr->kmalloc_cnt) == 0)
+                        resuable_MLT_hash_node_ptr = MLT_hash_node_ptr;
+        }
+
+        /* Re-using any delete-pending nodes */
+        if ((!found)&&(resuable_MLT_hash_node_ptr))
+        {
+                unsigned long *stack_trace, *save_trace;
+
+                /* point to the node we're about to insert */
+                metadata->MLT_hash_node_ptr = (void *)resuable_MLT_hash_node_ptr;
+
+                /* Fill up the info in tracking node */
+                atomic_set(&resuable_MLT_hash_node_ptr->kmalloc_cnt, 1);
+                atomic_set(&resuable_MLT_hash_node_ptr->total_alloc_size, obj_size_api(mlt_param->s));
+
+		atomic_inc(&outstanding_alloc_cnt);
+		atomic_add(obj_size_api(mlt_param->s), &outstanding_alloc_size);
+                resuable_MLT_hash_node_ptr->stk_trace_len = copy_count;
+                /* copy stack trace */
+                for (stack_trace = &mlt_stk_trace[stk_top_skip_cnt], save_trace =
+                     resuable_MLT_hash_node_ptr->stk_trace; copy_count; copy_count--) {
+                        *save_trace++ = *stack_trace++;
+                }
+
+                resuable_MLT_hash_node_ptr->stk_fn_hash = stk_fn_hash;
+#ifdef MLT_DEBUG
+                MLT_PROCESS_ERROR(MLT_NODE_REUSED);
+#endif
+
+                found = 1;
+        }
+        MLT_READ_UNLOCK(metadata->hash_index);
 
 	if (!found) {
 		unsigned long *stack_trace, *save_trace;
 		MLT_hash_node_t *new_node;
-		MLT_hash_table[metadata->hash_index].hash_count++;
-		/* If a tracking node doesn't exist, create a tracking node & inset it at the appropriate hash index linked list */
 
-		/* Allocate tracking node from slab cache; consider the flag of the allocation that we're processing */
-		new_node = kmem_cache_alloc(MLT_hash_nodes_pool, GFP_ATOMIC);	/*TBD: decide on the flags - GFP_ATOMIC - later. Should we get the flags from kmalloc or can we just go with atomic always */
+		new_node = kmem_cache_alloc_mlt_bypass(MLT_hash_nodes_pool, GFP_ATOMIC);
 		if (unlikely(!new_node)) {
 			printk(KERN_WARNING
 			       "%s: failed to allocate MLT_hash_node\n",
@@ -417,16 +501,14 @@ void MLT_kmalloc_processing(MLT_param_t *mlt_param)
 			return;
 		}
 		/* point to the node we're about to insert */
-		metadata->MLT_hash_node_ptr = new_node;
+		metadata->MLT_hash_node_ptr = (void *)new_node;
 
 		/* Fill up the info in tracking node */
 		atomic_set(&new_node->kmalloc_cnt, 1);
-		new_node->hash_control.hash_index = metadata->hash_index;
-		new_node->hash_control.bit_lock = 0;
-		new_node->hash_control.delete_wait_count = 0;
-		new_node->hash_control.delete_pending = 0;
-		new_node->hash_control.chain_len = 0;
-		atomic_set(&new_node->total_alloc_size, 0);
+		atomic_set(&new_node->total_alloc_size, obj_size_api(mlt_param->s));
+
+		atomic_inc(&outstanding_alloc_cnt);
+		atomic_add(obj_size_api(mlt_param->s), &outstanding_alloc_size);
 
 		new_node->stk_trace_len = copy_count;
 		/* copy stack trace */
@@ -436,99 +518,17 @@ void MLT_kmalloc_processing(MLT_param_t *mlt_param)
 			*save_trace++ = *stack_trace++;
 		}
 
-		//new_node->hash_control.hash_index = metadata->hash_index;
 		new_node->stk_fn_hash = stk_fn_hash;
 
-		/*
-		 * Insertion algorithm commence
-		 * At this point:
-		 * found == 0;
-		 * MLT_hash_node = &MLT_hash_table[hash_index], or head of list
-		 */
-		while (1) {
-			unsigned long flags;
-			unsigned timeout = 0;
-
-			/* IR: do we need preempt disable? */
-			/* disable and save irq */
-			local_irq_save(flags);
-
-			while (test_and_set_bit
-			       (MLT_LOCK_BIT_BE,
-				(volatile unsigned long *)&tail->hash_control)
-			       && timeout < 0x100000)
-				timeout++;
-
-			if (unlikely(timeout >= 0x100000)) {
-				local_irq_restore(flags);
-				kmem_cache_free(MLT_hash_nodes_pool, new_node);
-				printk(KERN_ERR
-				       "%s: timed out waiting on lock: hash_index=%d\n",
-				       __FUNCTION__, metadata->hash_index);
-				MLT_initialized = 0;	/* disable MLT */
-				break;
-			}
-#ifdef MLT_DEBUG
-			if (timeout) {
-				printk("%s: lock bit contention; timeout: %d\n",
-				       __FUNCTION__, timeout);
-			}
-#endif
-			/* we have the lock now */
-			/* are we still pointing to head? It is possible for multiple CPU's
-			 * to race to insert an element, so another CPU could've gotten ahead
-			 * of us to insert at tail, so *our* tail is no longer the tail, i.e.
-			 * if something got inserted, then we have a new tail. So, verify 
-			 * that head's prev still points to tail   */
-			if (container_of
-			    (MLT_hash_table[metadata->hash_index].MLT_hash_list_next.prev,
-			     MLT_hash_node_t, MLT_hash_list_next) == tail) {
+                MLT_WRITE_LOCK(metadata->hash_index);
 				/* insert at tail; */
 				list_add_tail(&new_node->MLT_hash_list_next,
 					      &MLT_hash_table[metadata->hash_index].
 					      MLT_hash_list_next);
-
-				MLT_hash_table[metadata->hash_index].hash_control.
-				    chain_len++;
-				/* unlock */
-				clear_bit(MLT_LOCK_BIT_BE,
-					  (volatile unsigned long *)&tail->
-					  hash_control);
-
-				/* restore irq */
-				local_irq_restore(flags);
-				break;
-			}
-
-			/* unlock */
-			clear_bit(MLT_LOCK_BIT_BE,
-				  (unsigned long *)&tail->hash_control);
-			/* restore irq */
-			local_irq_restore(flags);
-
-			/* Search for tail again in the list */
-			MLT_hash_node_ptr = tail = &MLT_hash_table[metadata->hash_index];
-        		list_for_each_entry(MLT_hash_node_ptr,
-                            		&MLT_hash_table[metadata->hash_index].MLT_hash_list_next,
-                            		MLT_hash_list_next) {
-                		tail = MLT_hash_node_ptr;       /* save tail, so as not to use prev pointer later */
-                		if ((MLT_hash_node_ptr->stk_trace_len == copy_count)
-                    		&& (MLT_hash_node_ptr->stk_fn_hash == stk_fn_hash)) {
-                        		metadata->MLT_hash_node_ptr = (void *)MLT_hash_node_ptr;
-                        		atomic_inc(& MLT_hash_node_ptr->kmalloc_cnt);
-                        		MLT_hash_node_ptr->hash_control.delete_wait_count = 0;
-                        		atomic_add(obj_size_api(mlt_param->s), &MLT_hash_node_ptr->total_alloc_size);
-                        		found = 1;
-                        		break;
-                		}
-        		}
-
-			if (unlikely(found)) {
-				/* free the allocation; rare case when two cpu's raced to insert the same thing */
-				kmem_cache_free(MLT_hash_nodes_pool, new_node);
-				break;
-			}
-		}
+#ifdef MLT_DEBUG
+                MLT_hash_table[metadata->hash_index].chain_len++;
+#endif
+                MLT_WRITE_UNLOCK(metadata->hash_index);
 	}
 
 	return;
@@ -540,9 +540,13 @@ EXPORT_SYMBOL(MLT_kmalloc_processing);
 
 void MLT_kfree_processing(MLT_param_t *mlt_param)
 {
-	unsigned short index;
+	unsigned short index, found=0;
         MLT_book_keeping_info_t *metadata;
 	MLT_hash_node_t *MLT_hash_node_ptr = NULL;
+	unsigned long flags;
+
+	if (unlikely(!mlt_enabled))
+		return;
 
 	if (unlikely(bypass_mlt))
 		return;
@@ -560,7 +564,6 @@ void MLT_kfree_processing(MLT_param_t *mlt_param)
 	if (unlikely(metadata->mlt_signature != MLT_PATH_SIGNATURE))
 	{
 		MLT_PROCESS_ERROR(MLT_CORRUPTED_MAGIC_NUM);
-		
 		return;
 	}
 
@@ -569,7 +572,6 @@ void MLT_kfree_processing(MLT_param_t *mlt_param)
 	{
 	    if ((metadata->hash_index_compl ^ index) == 0xFFFF) 
 	    {
-		struct list_head *pos;
 #ifdef MLT_DEBUG
 		if (MLT_hash_table[index].MLT_hash_list_next.next == NULL) {
 			printk
@@ -582,34 +584,39 @@ void MLT_kfree_processing(MLT_param_t *mlt_param)
 
 		}
 #endif
-		__list_for_each(pos, &MLT_hash_table[index].MLT_hash_list_next) {
-			if (container_of
-			    (pos, MLT_hash_node_t,
-			     MLT_hash_list_next) ==
-			    metadata->MLT_hash_node_ptr) {
-				MLT_hash_node_ptr =
-				    container_of(pos, MLT_hash_node_t,
-						 MLT_hash_list_next);
-				break;
-			}
+                MLT_READ_LOCK(index);
+                list_for_each_entry(MLT_hash_node_ptr,
+                            &MLT_hash_table[index].MLT_hash_list_next,
+                            MLT_hash_list_next) {
+                        if (MLT_hash_node_ptr == metadata->MLT_hash_node_ptr)
+                        {
+                                atomic_dec(&MLT_hash_node_ptr->kmalloc_cnt);
+		        atomic_sub(obj_size_api(mlt_param->s), &MLT_hash_node_ptr->total_alloc_size);
 
-		}
+				atomic_dec(&outstanding_alloc_cnt);
+		        	atomic_sub(obj_size_api(mlt_param->s), &outstanding_alloc_size);
+                                found = 1;
+                                break;
+                        }
+
+                }
+                MLT_READ_UNLOCK(index);
+
 		/* erase bookkeeping info */
 		metadata->hash_index ^= 0xFFFF;
 		metadata->mlt_signature = 0;
 		metadata->MLT_hash_node_ptr = (void *)0xFFFFFFFF;
-		if (MLT_hash_node_ptr) {
-			atomic_dec(& MLT_hash_node_ptr->kmalloc_cnt);
-		        atomic_sub(obj_size_api(mlt_param->s), &MLT_hash_node_ptr->total_alloc_size);
-
-		} else {
+		if (!found) {
 			MLT_PROCESS_ERROR(MLT_HASH_PTR_NOT_IN_LIST);
+			init_mlt_metadata(metadata);
 		}
 	    } else {
 		MLT_PROCESS_ERROR(MLT_BAD_HASH_INDEX);
+		init_mlt_metadata(metadata);
 	    }
 	} else {
 		MLT_PROCESS_ERROR(MLT_NULL_HASH_NODE_PTR);
+		init_mlt_metadata(metadata);
 	}
 
 }
@@ -671,6 +678,9 @@ static int MLT_config_write(struct file *file, const char *buffer,
 {
 	char *buff, *buff1, **end_ptr = NULL;
 	unsigned int i, tmp;
+#ifdef MLT_DEBUG
+	int m;
+#endif
 
 	if (count > 100)
 		return 0;	/* TBD: convert 100 to a macro */
@@ -679,7 +689,11 @@ static int MLT_config_write(struct file *file, const char *buffer,
 	MLT_conf_buff[count] = '\0';
 
 	buff = MLT_conf_buff;
+#ifdef MLT_DEBUG
+	for (i = 1; i <= 11 /* Max config entires */ ; i++) {
+#else
 	for (i = 1; i <= 10 /* Max config entires */ ; i++) {
+#endif
 		buff1 = buff;
 		while (MLT_isdigit(*buff))
 			buff++;
@@ -730,6 +744,15 @@ static int MLT_config_write(struct file *file, const char *buffer,
 			else 
 			    display_cnt = tmp;
 			break;
+#ifdef MLT_DEBUG
+                case 11:
+                        kmalloc_large_allocs=0;
+                        kmalloc_large_allocs = simple_strtoul(buff1, end_ptr, 10);
+printk("%s %d: kmalloc_large_allocs=%d \r\n", __FUNCTION__, __LINE__, kmalloc_large_allocs);
+			for (m=0; (m<kmalloc_large_allocs); m++)
+                        	kmalloc(/*16384*/ 131072, GFP_KERNEL);
+                        break;
+#endif
 		}
 	}
 
@@ -761,18 +784,47 @@ static int MLT_leaks_data_open(struct inode *inode, struct file *file)
 static int MLT_leaks_data_show(struct seq_file *m, void *arg)
 {
 	unsigned int i, j, k, l;
-	MLT_hash_node_t *MLT_hash_node, *n;
+	MLT_hash_node_t *MLT_hash_node;
 	char tmp_str1[MAX_MLT_FUNC_NAME_LEN], *tmp_str2,
 	    func_name[MAX_MLT_FUNC_NAME_LEN];
+	unsigned long flags;
+
+        if (!mlt_enabled)
+        {
+            seq_printf(m, "\r\nMLT not enabled. \r\n\n");
+            return 0;
+        }
+
+	if (mlt_km_enabled)
+	{
+        	seq_printf(m, "\r\nOutstanding kmem_cache_alloc allocations tracked by MLT: %d \r\n", 
+				atomic_read(&outstanding_alloc_cnt));
+        	seq_printf(m, "Outstanding kmem_cache_alloc memory tracked by MLT: ");
+	} else {
+        	seq_printf(m, "\r\nOutstanding kmalloc allocations tracked by MLT: %d \r\n", 
+				atomic_read(&outstanding_alloc_cnt));
+        	seq_printf(m, "Outstanding kmalloc memory tracked by MLT: ");
+	}
+
+        if ((atomic_read(&outstanding_alloc_size)/ 1048576) > 1)
+                seq_printf(m, "%6d.%d MB \r\n\n", atomic_read(&outstanding_alloc_size)/1048576,
+                    get_first_digit(atomic_read(&outstanding_alloc_size)%1048576));
+        else if ((atomic_read(&outstanding_alloc_size)/ 1024) > 1)
+                seq_printf(m, "%6d.%d KB \r\n\n", atomic_read(&outstanding_alloc_size)/1024,
+                    get_first_digit(atomic_read(&outstanding_alloc_size)%1024));
+        else
+                seq_printf(m, "%6d B \r\n\n", atomic_read(&outstanding_alloc_size));
+
 
         cur_display_node_cnt = 0;
 	for (i = 0; i < MLT_MAX_HASH; i++) {
-			/* IR: fix it for the new table layout */
-		list_for_each_entry_safe(MLT_hash_node, n,
+                MLT_READ_LOCK(i);
+		list_for_each_entry(MLT_hash_node,
 		 	&MLT_hash_table[i].MLT_hash_list_next, MLT_hash_list_next) 
 		{
 		    insert_sort(MLT_hash_node);
 		}
+                MLT_READ_UNLOCK(i);
 	}
 
         if (kmalloc_size_sort)
@@ -855,6 +907,44 @@ static int MLT_leaks_data_show(struct seq_file *m, void *arg)
 		}
 	}
 
+#ifdef CONFIG_SILKWORM_MLT_KMALLOC_LARGE
+	seq_printf(m, "\r\n\nOutstanding kmalloc_large allocations: %d \r\n\n", atomic_read(&kmalloc_large_cnt));
+        if (!mlt_kl_enabled)
+        {
+	    seq_printf(m, "    Note: If Outstanding kmalloc_large allocations is increasing over time, there could\r\n");
+	    seq_printf(m, "    be large size (> 2*PAGE_SIZE) allocations impacting available system memory.\r\n");
+	    seq_printf(m, "    Please consider enabling mlt_kl in boot args \r\n");
+	} else {
+	    seq_printf(m, "    Note: If Outstanding kmalloc_large allocations is increasing over time, there could\r\n");
+	    seq_printf(m, "    be large size (> 2*PAGE_SIZE) allocations impacting available system memory.\r\n");
+	    seq_printf(m, "    check mlt_kl command output as well.\r\n");
+	}
+#endif
+
+#ifdef CONFIG_SILKWORM_MLT_VMALLOC
+	seq_printf(m, "\r\nOutstanding vmalloc allocations: %d \r\n", atomic_read(&vmalloc_cnt));
+	seq_printf(m, "\rOutstanding vmalloc memory: ");
+        if ((atomic_read(&vmalloc_tot_size)/ 1048576) > 1)
+                seq_printf(m, "%6d.%d MB \r\n", atomic_read(&vmalloc_tot_size)/1048576,
+                    get_first_digit(atomic_read(&vmalloc_tot_size)%1048576));
+        else if ((atomic_read(&vmalloc_tot_size)/ 1024) > 1)
+                seq_printf(m, "%6d.%d KB \r\n", atomic_read(&vmalloc_tot_size)/1024,
+                    get_first_digit(atomic_read(&vmalloc_tot_size)%1024));
+        else
+                seq_printf(m, "%6d B \r\n", atomic_read(&vmalloc_tot_size));
+
+        if (!mlt_vm_enabled)
+        {
+	    seq_printf(m, "    Note: If Outstanding vmalloc allocations are increasing over time, there could\r\n");
+	    seq_printf(m, "    be vmalloc allocations impacting available system memory.\r\n");
+	    seq_printf(m, "    Please consider enabling mlt_vm in boot args \r\n\n");
+	} else {
+	    seq_printf(m, "    Note: If Outstanding vmalloc allocations are increasing over time, there could\r\n");
+	    seq_printf(m, "    be vmalloc allocations impacting available system memory.\r\n");
+	    seq_printf(m, "    check mlt_vm command output as well.\r\n\n");
+	}
+#endif
+
 	return 0;
 }
 
@@ -864,6 +954,23 @@ static int MLT_det_leaks_data_read(char *page, char **start, off_t off,
 	unsigned int k;
 
 	count = 0;
+
+        if (!mlt_enabled)
+        {
+            sprintf(page, "MLT not enabled.\r\n");
+            count += strlen(page);
+            *eof = 1;
+            return count;
+        }
+
+	if (detail_entry_index <= 0)
+	{
+            sprintf(page, "Invalid detail entry index - negative numbers not allowed.\r\n");
+            count += strlen(page);
+            *eof = 1;
+            return count;
+
+	}
 
 	if (detail_entry_index - 1 < cur_display_node_cnt) {
         	if (kmalloc_size_sort)
@@ -925,14 +1032,25 @@ static int MLT_det_leaks_data_read(char *page, char **start, off_t off,
 		}
 
 		count += strlen(page + count);
-		for (k = 1;
-		     (k <
-		      MLT_display_nodes[detail_entry_index - 1].stk_trace_len);
-		     k++) {
-			sprintf(page + count, "                %pS\n",
-				(void *)MLT_display_nodes[detail_entry_index -
-							  1].stk_trace[k]);
+		if (MLT_display_nodes[detail_entry_index - 1].stk_trace_len > MAX_MLT_HASH_STK_DEPTH)
+		{
+			sprintf(page + count, "stk_trace_len is > MAX_MLT_HASH_STK_DEPTH. Possible memory corruption\n");
 			count += strlen(page + count);
+		} else {
+			for (k = 1;
+		     	(k <
+		      	MLT_display_nodes[detail_entry_index - 1].stk_trace_len);
+		     	k++) {
+				if ((count + 2*KSYM_SYMBOL_LEN) >= PAGE_SIZE )
+				{
+					printk("Page limit reached, so curtailing the output\r\n");
+					break;
+				}
+				sprintf(page + count, "                %pS\n",
+					(void *)MLT_display_nodes[detail_entry_index -
+							  1].stk_trace[k]);
+				count += strlen(page + count);
+			}
 		}
 #if 0
 		sprintf(page + count,
@@ -979,6 +1097,11 @@ static int MLT_stats_data_open(struct inode *inode, struct file *file) {
 
 static int MLT_stats_data_show(struct seq_file *m, void *arg) {
 	unsigned int i, j, k, max_ind, stats_var;
+
+        if (!mlt_enabled) {
+            seq_printf(m, "\r\nMLT not enabled. \r\n\n");
+            return 0;
+        }
 
 	 stats_var = MLT_STATS_CLEAR_PERIOD;
 	 seq_printf(m, "\r\n");
@@ -1274,10 +1397,6 @@ static void MLT_log_stk_trace(int errCode) {
 
 }
 
-static int MLT_isdigit(char c) {
-	return ((c >= '0') && (c <= '9'));
-} 
-
 static __always_inline unsigned int MLT_hash(unsigned long *stk_trace,
 			       unsigned int stk_trace_len,
 			       unsigned int *stk_fn_hash) {
@@ -1337,13 +1456,6 @@ static void insert_sort(MLT_hash_node_t *hash_node)
 	}
 }
 
-static __always_inline int get_first_digit(int num)
-{
-    while (num >= 10)
-       num /= 10;
-    return num;
-}
-
 int mlt_garbage_collector(void *arg) {
 	static unsigned int list_index;
 #ifdef MLT_DEBUG
@@ -1352,7 +1464,6 @@ int mlt_garbage_collector(void *arg) {
 	struct MLT_garbage_collection_params *cp =
 	    (struct MLT_garbage_collection_params *)arg;
 	int entries = 8;	/* default value */
-	unsigned short mlt_delete_wait_count = 4;
 	int sleep_interval = 20;
 	int stats_clear =1, time_elapsed = 0;
 	unsigned long flags;
@@ -1360,7 +1471,6 @@ int mlt_garbage_collector(void *arg) {
 	if (cp) {
 		/* get non-default parameters */
 		entries = cp->entries;
-		mlt_delete_wait_count = cp->mlt_delete_wait_count;
 		sleep_interval = cp->sleep_interval;
 	}
 
@@ -1371,16 +1481,6 @@ int mlt_garbage_collector(void *arg) {
 			MLT_hash_node_t *pos, *n;
 			int x = 0;
 
-			/* free entries which were scheduled for deletion */
-			list_for_each_entry_safe(pos, n,
-						 &MLT_hash_table[list_index].
-						 scheduled_for_deletion,
-						 scheduled_for_deletion) {
-				BUG_ON(!pos->hash_control.delete_pending);
-				list_del(&pos->scheduled_for_deletion);
-				kmem_cache_free(MLT_hash_nodes_pool, pos);
-				x++;
-			}
 #ifdef MLT_DEBUG
 			if (x > max_chain_len) {
 				max_chain_len = x;
@@ -1391,57 +1491,22 @@ int mlt_garbage_collector(void *arg) {
 				     MLT_hash_table[list_index].stk_trace_len);
 			}
 #endif
-			list_for_each_entry_safe(pos, n,
-						 &MLT_hash_table[list_index].
-						 MLT_hash_list_next,
-						 MLT_hash_list_next) {
-				/* grace period is defined as: marked for list deletion bit set and time duration > NOMINAL (seconds) */
-				if (atomic_read(&pos->kmalloc_cnt) == 0
-				    && pos->hash_control.delete_wait_count >=
-				    mlt_delete_wait_count) {
-					/* SYNC POINT: sync with the inserter */
-					/* disable IRQ's */
-					local_save_flags(flags);
-					/* test_and_set lock bit on previous */
-					if (test_and_set_bit
-					    (MLT_LOCK_BIT_BE,
-					     (volatile unsigned long *)&pos->
-					     hash_control) != 0) {
-						local_irq_restore(flags);
-						continue;	/* if fail, get out */
-					}
+                        MLT_WRITE_LOCK(list_index);
+                        list_for_each_entry_safe(pos, n, &MLT_hash_table[list_index].
+                                                 MLT_hash_list_next, MLT_hash_list_next) {
+                                if (atomic_read(&pos->kmalloc_cnt) == 0)
+                                {
+                                        list_del(&pos->MLT_hash_list_next);
+                                        kmem_cache_free_mlt_bypass(MLT_hash_nodes_pool, pos);
+                                        x++;
+#ifdef MLT_DEBUG
+                                        MLT_hash_table[list_index].chain_len--;
+                                        MLT_PROCESS_ERROR(MLT_NODE_FREED);
+#endif
+                                }
 
-					/* do an RCU delete, which essentially by-passes the deleter, 
-					   without taking it out of the list
-
-					   [ prev  ]<-------[ deleted ]------------>[ next ]
-					   | ^                                     | ^
-					   | |_____________________________________| |
-					   |_________________________________________|
-
-					   ...so, the deleted can still be validly used for a while by whoever is walking the list. 
-					 */
-					list_del_rcu(&pos->MLT_hash_list_next);
-
-					/* release bit lock */
-					clear_bit(MLT_LOCK_BIT_BE,
-						  (unsigned long *)&pos->
-						  hash_control);
-					pos->hash_control.delete_pending = 1;
-					MLT_hash_table[list_index].hash_control.
-					    chain_len--;
-					local_irq_restore(flags);
-					/* add it to the list of items to be freed */
-					list_add_tail(&pos->
-						      scheduled_for_deletion,
-						      &MLT_hash_table
-						      [list_index].
-						      scheduled_for_deletion);
-				} else if (atomic_read(&pos->kmalloc_cnt) == 0) {
-					pos->hash_control.delete_wait_count++;
-				}
-
-			}
+                        }
+                        MLT_WRITE_UNLOCK(list_index);
 		}
 		
 		/* Clear MLT Stats 5 minnutes after reboot */
@@ -1470,9 +1535,24 @@ int MLT_get_panicdump_info(void *pdHandle, unsigned int event, void *cbArg,
 	char buff1[300];
 	unsigned int max_ind, max_len;
 	char buff2[200];
-	MLT_hash_node_t *MLT_hash_node, *n;
+	MLT_hash_node_t *MLT_hash_node;
 	char tmp_str1[MAX_MLT_FUNC_NAME_LEN], *tmp_str2,
 	    func_name[MAX_MLT_FUNC_NAME_LEN];
+	unsigned long flags;
+
+	if (unlikely(!MLT_initialized))
+        {
+                *buff = MLT_PD_tmp_buff1;
+                *len = strlen(MLT_PD_tmp_buff1);
+                return 0;
+        }
+
+        if (!mlt_enabled)
+        {
+                *buff = MLT_PD_tmp_buff;
+                *len = strlen(MLT_PD_tmp_buff);
+                return 0;
+        }
 
 	/*
 	 * MLT panicdump buffer region has been fill with the MLT info when
@@ -1492,12 +1572,13 @@ int MLT_get_panicdump_info(void *pdHandle, unsigned int event, void *cbArg,
 	do {
         	cur_display_node_cnt = 0;
         	for (i = 0; i < MLT_MAX_HASH; i++) {
-                        	/* IR: fix it for the new table layout */
-                	list_for_each_entry_safe(MLT_hash_node, n,
+                	MLT_READ_LOCK(i);
+                	list_for_each_entry(MLT_hash_node, 
                         	&MLT_hash_table[i].MLT_hash_list_next, MLT_hash_list_next)
                 	{
                     	    insert_sort(MLT_hash_node);
                 	}
+                	MLT_READ_UNLOCK(i);
         	}
 	
 		if (count+2 < max_len)
@@ -1641,6 +1722,78 @@ int MLT_get_panicdump_info(void *pdHandle, unsigned int event, void *cbArg,
 
         	if (kmalloc_size_sort)
 		{
+#ifdef CONFIG_SILKWORM_MLT_KMALLOC_LARGE
+			sprintf(buff1, "\r\n\nOutstanding kmalloc_large allocations: %d \r\n\n", 
+				atomic_read(&kmalloc_large_cnt));
+			if ((count + strlen(buff1)) < max_len)
+			{ 
+	    			sprintf(MLT_PD_buff + count, buff1);
+	    			count += strlen(buff1);
+			} else 
+	    			goto buff_too_large;
+#endif
+
+#ifdef CONFIG_SILKWORM_MLT_VMALLOC
+			sprintf(buff1, "\r\nOutstanding vmalloc allocations: %d \r\n", atomic_read(&vmalloc_cnt));
+			if ((count + strlen(buff1)) < max_len)
+			{ 
+	    			sprintf(MLT_PD_buff + count, buff1);
+	    			count += strlen(buff1);
+			} else 
+	    			goto buff_too_large;
+
+			sprintf(buff1, "\rOutstanding vmalloc memory: ");
+			if ((count + strlen(buff1)) < max_len)
+			{ 
+	    			sprintf(MLT_PD_buff + count, buff1);
+	    			count += strlen(buff1);
+			} else 
+	    			goto buff_too_large;
+
+        		if ((atomic_read(&vmalloc_tot_size)/ 1048576) > 1)
+			{
+                		sprintf(buff1, "%6d.%d MB \r\n", atomic_read(&vmalloc_tot_size)/1048576,
+                    		get_first_digit(atomic_read(&vmalloc_tot_size)%1048576));
+				if ((count + strlen(buff1)) < max_len)
+				{ 
+	    				sprintf(MLT_PD_buff + count, buff1);
+	    				count += strlen(buff1);
+				} else 
+	    				goto buff_too_large;
+
+        		} else if ((atomic_read(&vmalloc_tot_size)/ 1024) > 1) {
+			
+                		sprintf(buff1, "%6d.%d KB \r\n", atomic_read(&vmalloc_tot_size)/1024,
+                    		get_first_digit(atomic_read(&vmalloc_tot_size)%1024));
+				if ((count + strlen(buff1)) < max_len)
+				{ 
+	    				sprintf(MLT_PD_buff + count, buff1);
+	    				count += strlen(buff1);
+				} else 
+	    				goto buff_too_large;
+
+        		} else {
+                		sprintf(buff1, "%6d B \r\n", atomic_read(&vmalloc_tot_size));
+				if ((count + strlen(buff1)) < max_len)
+				{ 
+	    				sprintf(MLT_PD_buff + count, buff1);
+	    				count += strlen(buff1);
+				} else 
+	    				goto buff_too_large;
+
+			}
+#endif
+			if (count+2 < max_len)
+			{
+				sprintf(MLT_PD_buff + count, "\n\n");
+				count += 2;
+			} else 
+				goto buff_too_large;
+	
+		}
+
+        	if (kmalloc_size_sort)
+		{
 	    		sprintf(buff1, "Display Index   Stack Trace making the allocations"
 			  		"                  Number of kmallocs made (Total Mem Allocated)\n");
         	} else  {
@@ -1676,7 +1829,7 @@ int MLT_get_panicdump_info(void *pdHandle, unsigned int event, void *cbArg,
 		} else 
 			goto buff_too_large;
 	
-		for (j = 0; ((j < cur_display_node_cnt) || (j < MLT_PANIC_DUMP_DISPLAY_CNT)); j++) {
+		for (j = 0; ((j < cur_display_node_cnt) && (j < MLT_PANIC_DUMP_DISPLAY_CNT)); j++) {
 	
         		if (kmalloc_size_sort)
         		{
@@ -1941,9 +2094,301 @@ mlt_pd_out:
 
 }
 
-
-
 EXPORT_SYMBOL(MLT_get_panicdump_info);
+
+int MLT_print_panicdump_info(void)
+{
+        unsigned int i, j, k, l, stats_var = 0;
+        unsigned int max_ind;
+        MLT_hash_node_t *MLT_hash_node;
+        char tmp_str1[MAX_MLT_FUNC_NAME_LEN], *tmp_str2,
+            func_name[MAX_MLT_FUNC_NAME_LEN];
+	unsigned long flags;
+
+        if (!mlt_enabled)
+        {
+                printk(KERN_CRIT "MLT not enabled. \r\n");
+                return 0;
+        }
+
+	if (unlikely(!MLT_initialized))
+        {
+                printk(KERN_CRIT "\nMLT not initlialized yet.\r\n");
+                return 0;
+        }
+
+        kmalloc_size_sort = 1;
+
+        do {
+                cur_display_node_cnt = 0;
+                for (i = 0; i < MLT_MAX_HASH; i++) {
+                	MLT_READ_LOCK(i);
+                        list_for_each_entry(MLT_hash_node,
+                                &MLT_hash_table[i].MLT_hash_list_next, MLT_hash_list_next)
+                        {
+                            insert_sort(MLT_hash_node);
+                        }
+                	MLT_READ_UNLOCK(i);
+                }
+
+                printk(KERN_CRIT "\n\n");
+
+                if (kmalloc_size_sort)
+                        printk(KERN_CRIT "Dumping Memory Leak Traces (MLT) - KMALLOC SIZE SORTED");
+                else
+                        printk(KERN_CRIT "Dumping Memory Leak Traces (MLT) - KMALLOC COUNT SORTED");
+
+                printk(KERN_CRIT "\n\n");
+
+                if (kmalloc_size_sort)
+                {
+                        printk(KERN_CRIT "Display Index   Stack Trace making the allocations"
+                                "                  Number of kmallocs made (Total Mem Allocated)\n");
+                } else {
+                        printk(KERN_CRIT "Display Index   Stack Trace making the allocations"
+                                "                  Total Memory allocated (Alloc Count)\n");
+                }
+
+                if (kmalloc_size_sort)
+                {
+                        printk(KERN_CRIT "-------------   ----------------------------------"
+                                "                  -----------------------\n");
+                } else {
+                        printk(KERN_CRIT "-------------   ----------------------------------"
+                                "                  -------------------\n");
+                }
+
+                for (j = 0; ((j < cur_display_node_cnt) && (j < MLT_PANIC_DUMP_DISPLAY_CNT)) ; j++) {
+                        for (l = 0; l < MLT_display_nodes[j].stk_trace_len; l++) {
+                                if (is_vmalloc_or_module_addr((void *)MLT_display_nodes[j].stk_trace[l]))
+                                        break;
+                        }
+                        if (l == MLT_display_nodes[j].stk_trace_len) {
+                                for (l = 0; l < MLT_display_nodes[j].stk_trace_len; l++) {
+                                        memset(tmp_str1, 0, MAX_MLT_FUNC_NAME_LEN);
+                                        memset(func_name, 0, MAX_MLT_FUNC_NAME_LEN);
+                                        tmp_str2 = NULL;
+                                        //strcpy(tmp_str1, MLT_display_nodes[j].stk_trace[l]);
+                                        sprintf(tmp_str1, "%pS",
+                                                (void *)MLT_display_nodes[j].stk_trace[l]);
+                                        tmp_str2 = strchr(tmp_str1, '+');
+                                        if (!tmp_str2)
+                                                break;
+                                        *tmp_str2 = '\0';
+                                        strcpy(func_name, tmp_str1);
+
+                                        for (k = 0; k < wrp_stk_fn_cnt; k++)
+                                                if (!strcmp(func_name, wrp_stk_func[k]))
+                                                        break;
+                                        if (k == wrp_stk_fn_cnt)
+                                                break;
+                                }
+                        }
+
+                        if (kmalloc_size_sort)
+                        {
+                            if ((atomic_read(&MLT_display_nodes[j].total_alloc_size) /1048576) > 1)
+                                printk(KERN_CRIT "%13d   %-60pS  %6d.%1d MB  (%d)\n", j + 1,
+                                (void *)MLT_display_nodes[j].stk_trace[l],
+                                atomic_read(&MLT_display_nodes[j].total_alloc_size) /1048576,
+                                get_first_digit(atomic_read(&MLT_display_nodes[j].total_alloc_size) %1048576),
+                                atomic_read(&MLT_display_nodes[j].kmalloc_cnt));
+                            else if ((atomic_read(&MLT_display_nodes[j].total_alloc_size) /1024) > 1)
+                                printk(KERN_CRIT "%13d   %-60pS  %6d.%1d KB  (%d)\n", j + 1,
+                                (void *)MLT_display_nodes[j].stk_trace[l],
+                                atomic_read(&MLT_display_nodes[j].total_alloc_size) /1024,
+                                get_first_digit(atomic_read(&MLT_display_nodes[j].total_alloc_size) %1024),
+                                atomic_read(&MLT_display_nodes[j].kmalloc_cnt));
+                            else
+                                printk(KERN_CRIT "%13d   %-60pS  %6d B  (%d)\n", j + 1,
+                                (void *)MLT_display_nodes[j].stk_trace[l],
+                                atomic_read(&MLT_display_nodes[j].total_alloc_size),
+                                atomic_read(&MLT_display_nodes[j].kmalloc_cnt));
+                        } else {
+                            if ((atomic_read(&MLT_display_nodes[j].total_alloc_size) /1048576) > 1)
+                                printk(KERN_CRIT "%13d   %-60pS  %6d (%d.%1d MB)\n", j + 1,
+                                (void *)MLT_display_nodes[j].stk_trace[l],
+                                atomic_read(&MLT_display_nodes[j].kmalloc_cnt),
+                                atomic_read(&MLT_display_nodes[j].total_alloc_size) /1048576,
+                                get_first_digit(atomic_read(&MLT_display_nodes[j].total_alloc_size) %1048576));
+                            else if ((atomic_read(&MLT_display_nodes[j].total_alloc_size) /1024) > 1)
+                                printk(KERN_CRIT "%13d   %-60pS  %6d (%d.%1d KB) \n", j + 1,
+                                (void *)MLT_display_nodes[j].stk_trace[l],
+                                atomic_read(&MLT_display_nodes[j].kmalloc_cnt),
+                                atomic_read(&MLT_display_nodes[j].total_alloc_size) /1024,
+                                get_first_digit(atomic_read(&MLT_display_nodes[j].total_alloc_size) %1024));
+                            else
+                                printk(KERN_CRIT "%13d   %-60pS  %6d (%1d B)\n", j + 1,
+                                (void *)MLT_display_nodes[j].stk_trace[l],
+                                atomic_read(&MLT_display_nodes[j].kmalloc_cnt),
+                                atomic_read(&MLT_display_nodes[j].total_alloc_size));
+                        }
+                }
+
+                printk(KERN_CRIT "\n\n");
+
+		if (kmalloc_size_sort)
+		{ 
+#ifdef CONFIG_SILKWORM_MLT_KMALLOC_LARGE
+			printk(KERN_CRIT, "\r\n\nOutstanding kmalloc_large allocations: %d \r\n\n",
+			       atomic_read(&kmalloc_large_cnt));
+#endif
+
+#ifdef CONFIG_SILKWORM_MLT_VMALLOC
+			printk(KERN_CRIT, "\r\nOutstanding vmalloc allocations: %d \r\n", 
+			       atomic_read(&vmalloc_cnt));
+			printk(KERN_CRIT, "\rOutstanding vmalloc memory: ");
+        		if ((atomic_read(&vmalloc_tot_size)/ 1048576) > 1)
+                		printk(KERN_CRIT, "%6d.%d MB \r\n", atomic_read(&vmalloc_tot_size)/1048576,
+                    		get_first_digit(atomic_read(&vmalloc_tot_size)%1048576));
+        		else if ((atomic_read(&vmalloc_tot_size)/ 1024) > 1)
+                		printk(KERN_CRIT, "%6d.%d KB \r\n", atomic_read(&vmalloc_tot_size)/1024,
+                    		get_first_digit(atomic_read(&vmalloc_tot_size)%1024));
+        		else
+                		printk(KERN_CRIT, "%6d B \r\n", atomic_read(&vmalloc_tot_size));
+#endif
+                	printk(KERN_CRIT "\n\n");
+		}
+
+		if (kmalloc_size_sort)
+		{ 
+			if (!(console_mlt & MLT_CONSOLE_SIZE_DETAILED))
+			{
+                        	kmalloc_size_sort =0;
+				continue;
+			}
+		} else {
+			if (!(console_mlt & MLT_CONSOLE_CNT_DETAILED))
+                        	break;
+		}
+
+                if (kmalloc_size_sort)
+                {
+                        printk(KERN_CRIT  "Display Index   Stack Trace making the allocations"
+                                        "                  Number of kmallocs made (Total Mem Allocated)\n");
+                } else  {
+                        printk(KERN_CRIT  "Display Index   Stack Trace making the allocations"
+                                        "                  Total Memory allocated (Alloc Count)\n");
+                }
+
+                if (kmalloc_size_sort)
+                        printk(KERN_CRIT  "-------------   ----------------------------------"
+                                        "                  -----------------------\n");
+                else
+                        printk(KERN_CRIT  "-------------   ----------------------------------"
+                                        "                  -------------------\n");
+
+                printk(KERN_CRIT "\n");
+
+                for (j = 0; ((j < cur_display_node_cnt) && (j < MLT_OOM_DETAILED_DUMP_DISPLAY_CNT)); j++) {
+
+                        if (kmalloc_size_sort)
+                        {
+                            if ((atomic_read(&MLT_display_nodes[j].total_alloc_size) / 1048576) > 1)
+                                printk(KERN_CRIT  "%13d   %-60pS  %6d.%d MB (%d)\n", j + 1,
+                                (void *)MLT_display_nodes[j].stk_trace[0],
+                                atomic_read(&MLT_display_nodes[j].total_alloc_size)/1048576,
+                                get_first_digit(atomic_read(&MLT_display_nodes[j].total_alloc_size)%1048576),
+                                atomic_read(&MLT_display_nodes[j].kmalloc_cnt));
+                            else if ((atomic_read(&MLT_display_nodes[j].total_alloc_size) / 1024) > 1)
+                                printk(KERN_CRIT  "%13d   %-60pS  %6d.%d KB (%d)\n", j + 1,
+                                (void *)MLT_display_nodes[j].stk_trace[0],
+                                atomic_read(&MLT_display_nodes[j].total_alloc_size)/1024,
+                                get_first_digit(atomic_read(&MLT_display_nodes[j].total_alloc_size)%1024),
+                                atomic_read(&MLT_display_nodes[j].kmalloc_cnt));
+                            else
+                                printk(KERN_CRIT  "%13d   %-60pS  %6d B (%d)\n", j + 1,
+                                (void *)MLT_display_nodes[j].stk_trace[0],
+                                atomic_read(&MLT_display_nodes[j].total_alloc_size),
+                                atomic_read(&MLT_display_nodes[j].kmalloc_cnt));
+                        } else {
+                            if ((atomic_read(&MLT_display_nodes[j].total_alloc_size) / 1048576) > 1)
+                                printk(KERN_CRIT  "%13d   %-60pS  %6d (%d.%d MB)\n", j + 1,
+                                (void *)MLT_display_nodes[j].stk_trace[0],
+                                atomic_read(&MLT_display_nodes[j].kmalloc_cnt),
+                                atomic_read(&MLT_display_nodes[j].total_alloc_size)/1048576,
+                                get_first_digit(atomic_read(&MLT_display_nodes[j].total_alloc_size)%1048576));
+                            else if ((atomic_read(&MLT_display_nodes[j].total_alloc_size) / 1024) > 1)
+                                printk(KERN_CRIT  "%13d   %-60pS  %6d (%d.%d KB)\n", j + 1,
+                                (void *)MLT_display_nodes[j].stk_trace[0],
+                                atomic_read(&MLT_display_nodes[j].kmalloc_cnt),
+                                atomic_read(&MLT_display_nodes[j].total_alloc_size)/1024,
+                                get_first_digit(atomic_read(&MLT_display_nodes[j].total_alloc_size)%1024));
+                            else
+                                printk(KERN_CRIT  "%13d   %-60pS  %6d (%d B)\n", j + 1,
+                                (void *)MLT_display_nodes[j].stk_trace[0],
+                                atomic_read(&MLT_display_nodes[j].kmalloc_cnt),
+                                atomic_read(&MLT_display_nodes[j].total_alloc_size));
+                        }
+
+                        for (k = 1; (k < MLT_display_nodes[j].stk_trace_len); k++) {
+                                printk(KERN_CRIT  "                %pS\n",
+                                        (void *)MLT_display_nodes[j].stk_trace[k]);
+                        }
+
+                        printk(KERN_CRIT "\n");
+                }
+
+                printk(KERN_CRIT "\n\n");
+
+                if (kmalloc_size_sort)
+                        kmalloc_size_sort =0;
+                else
+                        break;
+        } while (1);
+
+
+        stats_var = MLT_STATS_CLEAR_PERIOD;
+        printk(KERN_CRIT  "MLT Stats are valid if collected only after %d minutes from bootup \r\n", stats_var);
+        printk(KERN_CRIT  "In other cases such as boot time crashes etc, this info might indicate errors incorrectly \r\n\n\n");
+
+        printk(KERN_CRIT  "  Number of occurences        Stat/Error Name\n");
+        printk(KERN_CRIT  "  ---------------------       --------------------- \n\n");
+
+        for (i = 1; i < MLT_MAX_STAT; i++)
+        {
+                printk(KERN_CRIT  "%13d              %s \n", atomic_read(&MLT_stats[i]),
+                            MLT_stats_names[i]);
+        }
+
+	if (!(console_mlt & MLT_CONSOLE_STATS_DETAILED))
+		return 0;
+
+        max_ind = atomic_read(&MLT_detailed_stats_cur_index);
+
+        if (!max_ind)
+                return 0;
+
+        if (max_ind >= MLT_MAX_STATS_NODES)
+                max_ind = MLT_MAX_STATS_NODES -1;
+
+        printk(KERN_CRIT 
+           "Detailed stats array contents (Latest occuring fisrt): \n\n");
+
+        for (i = 0, k = max_ind - 1;
+             ((i < max_ind) && (i < max_detail_stats) && (k>0)); i++, k--)
+        {
+                if (MLT_detailed_stats[k].statsID != MLT_UNINITIALIZED)
+                {
+                        printk(KERN_CRIT  "        Stats/Error Name: %s\n",
+                                MLT_stats_names[MLT_detailed_stats[k].statsID]);
+                        printk(KERN_CRIT  "        Stack Trace:\n");
+
+                        for (j = 0; (j < MLT_detailed_stats[k].stk_trace_len); j++)
+                        {
+                                printk(KERN_CRIT  "            %pS\n",
+                                        (void *)MLT_detailed_stats[k].stk_trace[j]);
+                        }
+
+                        printk(KERN_CRIT "\n");
+                }
+        }
+
+        return 0;
+
+}
+
+EXPORT_SYMBOL(MLT_print_panicdump_info);
 
 module_init(MLT_init);
 module_exit(MLT_deinit);
